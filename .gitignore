@@ -1,4 +1,6 @@
 # Byte-compiled / optimized / DLL files
+tmp
+*.ttf
 __pycache__/
 *.py[cod]
 *$py.class
@@ -107,6 +109,7 @@ venv.bak/
 
 .vscode
 .idea
+.run
 
 # custom
 *.pkl
@@ -125,7 +128,24 @@ result.png
 result.jpg
 result.mp4
 output/
+outputs/
+wandb/
+swanlog/
 *.out
+benchmarks/
+eval_output/
+eval_outputs/
+vlmeval/
+my_model/
+/data
+result/
+images
+/custom/
+megatron_output/
+/*-mcore/
+/*-hf/
+/*_cached_dataset/
+/sample_output/
 
 # Pytorch
 *.pth

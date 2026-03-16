@@ -1,53 +1,49 @@
-import os.path
+# Copyright (c) ModelScope Contributors. All rights reserved.
+import gradio as gr
+from functools import partial
 from typing import Type
 
-import gradio as gr
-import json
-
-from swift.llm import MODEL_MAPPING, TEMPLATE_MAPPING, ModelType
-from swift.ui.base import BaseUI
-from swift.ui.llm_infer.generate import Generate
+from swift.arguments import DeployArguments
+from swift.model import ModelType, get_model_list
+from swift.template import TEMPLATE_MAPPING
+from ..base import BaseUI
+from .generate import Generate
 
 
 class Model(BaseUI):
-    llm_train = 'llm_infer'
+
+    group = 'llm_infer'
 
     sub_ui = [Generate]
 
     locale_dict = {
-        'checkpoint': {
-            'value': {
-                'zh': '训练后的模型',
-                'en': 'Trained model'
-            }
-        },
         'model_type': {
             'label': {
-                'zh': '选择模型',
-                'en': 'Select Model'
+                'zh': '选择模型类型',
+                'en': 'Select Model Type'
             },
             'info': {
-                'zh': 'SWIFT已支持的模型名称',
-                'en': 'Base model supported by SWIFT'
+                'zh': 'SWIFT已支持的模型类型',
+                'en': 'Base model type supported by SWIFT'
             }
         },
         'deploy_checkpoint': {
             'value': {
                 'zh': '部署模型',
-                'en': 'Deploy model'
+                'en': 'Deploy model',
             }
         },
-        'model_id_or_path': {
+        'model': {
             'label': {
                 'zh': '模型id或路径',
                 'en': 'Model id or path'
             },
             'info': {
-                'zh': '实际的模型id',
-                'en': 'The actual model id or model path'
+                'zh': '实际的模型id，如果是训练后的模型请填入checkpoint-xxx的目录',
+                'en': 'The actual model id or path, if is a trained model, please fill in the checkpoint-xxx dir'
             }
         },
-        'template_type': {
+        'template': {
             'label': {
                 'zh': '模型Prompt模板类型',
                 'en': 'Prompt template type'
@@ -57,27 +53,27 @@ class Model(BaseUI):
                 'en': 'Choose the template type of the model'
             }
         },
-        'system': {
+        'merge_lora': {
             'label': {
-                'zh': 'system字段',
-                'en': 'system'
+                'zh': '合并LoRA',
+                'en': 'Merge LoRA'
             },
             'info': {
-                'zh': 'system字段支持在加载模型后修改',
-                'en': 'system can be modified after the model weights loaded'
+                'zh': '仅在`tuner_type=lora`时可用',
+                'en': 'Only available when `tuner_type=lora`'
             }
         },
-        'infer_backend': {
+        'adapters': {
             'label': {
-                'zh': '推理后端',
-                'en': 'Inference backend'
+                'zh': 'adapter id或路径',
+                'en': 'adapter id/path'
             },
-        },
-        'gpu_memory_utilization': {
-            'label': {
-                'zh': 'gpu显存使用率',
-                'en': 'Gpu memory utilization'
-            },
+            'info': {
+                'zh':
+                '只有一个lora模块时填adapter路径或`name=/path`；多个lora模块时填键值对：`name1=/path1 name2=/path2`',
+                'en': ('Single LoRA: Use path or name=/path. '
+                       'Multiple LoRAs: Use key-value pairs, e.g., name1=/path1 name2=/path2.')
+            }
         },
         'more_params': {
             'label': {
@@ -85,8 +81,8 @@ class Model(BaseUI):
                 'en': 'More params'
             },
             'info': {
-                'zh': '以json格式填入',
-                'en': 'Fill in with json format'
+                'zh': '以json格式或--xxx xxx命令行格式填入',
+                'en': 'Fill in with json format or --xxx xxx cmd format'
             }
         },
         'reset': {
@@ -95,104 +91,39 @@ class Model(BaseUI):
                 'en': 'Reset to default'
             },
         },
+        'infer_backend': {
+            'label': {
+                'zh': '推理框架',
+                'en': 'Infer backend'
+            },
+        },
     }
 
     @classmethod
     def do_build_ui(cls, base_tab: Type['BaseUI']):
-        with gr.Row():
-            model_type = gr.Dropdown(
-                elem_id='model_type',
-                choices=[base_tab.locale('checkpoint', cls.lang)['value']]
-                + ModelType.get_model_name_list() + cls.get_custom_name_list(),
-                value=base_tab.locale('checkpoint', cls.lang)['value'],
-                scale=20)
-            model_id_or_path = gr.Textbox(
-                elem_id='model_id_or_path',
-                lines=1,
-                scale=20,
-                interactive=True)
-            template_type = gr.Dropdown(
-                elem_id='template_type',
-                choices=list(TEMPLATE_MAPPING.keys()) + ['AUTO'],
-                scale=20)
-            reset_btn = gr.Button(elem_id='reset', scale=2)
-            model_state = gr.State({})
-        with gr.Row():
-            system = gr.Textbox(elem_id='system', lines=4, scale=20)
-        with gr.Row():
+        with gr.Row(equal_height=True):
             gr.Dropdown(
-                elem_id='infer_backend',
-                choices=['AUTO', 'vllm', 'pt'],
-                value='AUTO',
-                scale=20)
-            gr.Textbox(
-                elem_id='gpu_memory_utilization', value=0.9, lines=1, scale=20)
-        Generate.build_ui(base_tab)
+                elem_id='model',
+                scale=20,
+                choices=get_model_list(),
+                value='Qwen/Qwen2.5-7B-Instruct',
+                allow_custom_value=True)
+            gr.Dropdown(elem_id='model_type', choices=ModelType.get_model_name_list(), scale=20)
+            gr.Dropdown(elem_id='template', choices=list(TEMPLATE_MAPPING.keys()), scale=20)
+            gr.Checkbox(elem_id='merge_lora', scale=4)
+            gr.Button(elem_id='reset', scale=2)
         with gr.Row():
+            gr.Dropdown(elem_id='infer_backend', value='transformers', scale=5)
+        Generate.set_lang(cls.lang)
+        Generate.build_ui(base_tab)
+        with gr.Row(equal_height=True):
+            gr.Textbox(elem_id='adapters', lines=1, is_list=True, scale=40)
             gr.Textbox(elem_id='more_params', lines=1, scale=20)
             gr.Button(elem_id='deploy_checkpoint', scale=2, variant='primary')
 
-        def update_input_model(choice, model_state=None):
-            if choice == base_tab.locale('checkpoint', cls.lang)['value']:
-                if model_state and choice in model_state:
-                    model_id_or_path = model_state[choice]
-                else:
-                    model_id_or_path = None
-                default_system = None
-                template = None
-            else:
-                if model_state and choice in model_state:
-                    model_id_or_path = model_state[choice]
-                else:
-                    model_id_or_path = MODEL_MAPPING[choice][
-                        'model_id_or_path']
-                default_system = getattr(
-                    TEMPLATE_MAPPING[MODEL_MAPPING[choice]['template']]
-                    ['template'], 'default_system', None)
-                template = MODEL_MAPPING[choice]['template']
-            return model_id_or_path, default_system, template
-
-        def update_model_id_or_path(model_type, path, system, template_type,
-                                    model_state):
-            if not path or not os.path.exists(path):
-                return system, template_type, model_state
-            local_path = os.path.join(path, 'sft_args.json')
-            if not os.path.exists(local_path):
-                default_system = getattr(
-                    TEMPLATE_MAPPING[MODEL_MAPPING[model_type]['template']]
-                    ['template'], 'default_system', None)
-                template = MODEL_MAPPING[model_type]['template']
-                return default_system, template, model_state
-
-            with open(local_path, 'r') as f:
-                sft_args = json.load(f)
-            base_model_type = sft_args['model_type']
-            system = getattr(
-                TEMPLATE_MAPPING[MODEL_MAPPING[base_model_type]['template']]
-                ['template'], 'default_system', None)
-            model_state[model_type] = path
-            return sft_args['system'] or system, sft_args[
-                'template_type'], model_state
-
-        model_type.change(
-            update_input_model,
-            inputs=[model_type, model_state],
-            outputs=[model_id_or_path, system, template_type])
-
-        model_id_or_path.change(
-            update_model_id_or_path,
-            inputs=[
-                model_type, model_id_or_path, system, template_type,
-                model_state
-            ],
-            outputs=[system, template_type, model_state])
-
-        def reset(model_type):
-            model_id_or_path, default_system, template = update_input_model(
-                model_type)
-            return model_id_or_path, default_system, template, {}
-
-        reset_btn.click(
-            reset,
-            inputs=[model_type],
-            outputs=[model_id_or_path, system, template_type, model_state])
+    @classmethod
+    def after_build_ui(cls, base_tab: Type['BaseUI']):
+        cls.element('model').change(
+            partial(cls.update_input_model, arg_cls=DeployArguments, has_record=False),
+            inputs=[cls.element('model')],
+            outputs=list(cls.valid_elements().values()))

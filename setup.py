@@ -1,8 +1,9 @@
-# Copyright (c) Alibaba, Inc. and its affiliates.
+# Copyright (c) ModelScope Contributors. All rights reserved.
 # !/usr/bin/env python
-import os
-import shutil
 from setuptools import find_packages, setup
+
+import os
+from typing import List
 
 
 def readme():
@@ -67,8 +68,7 @@ def parse_requirements(fname='requirements.txt', with_version=True):
                     if ';' in rest:
                         # Handle platform specific dependencies
                         # http://setuptools.readthedocs.io/en/latest/setuptools.html#declaring-platform-specific-dependencies
-                        version, platform_deps = map(str.strip,
-                                                     rest.split(';'))
+                        version, platform_deps = map(str.strip, rest.split(';'))
                         info['platform_deps'] = platform_deps
                     else:
                         version = rest  # NOQA
@@ -82,8 +82,7 @@ def parse_requirements(fname='requirements.txt', with_version=True):
                 if line.startswith('http'):
                     print('skip http requirements %s' % line)
                     continue
-                if line and not line.startswith('#') and not line.startswith(
-                        '--'):
+                if line and not line.startswith('#') and not line.startswith('--'):
                     for info in parse_line(line):
                         yield info
                 elif line and line.startswith('--find-links'):
@@ -121,43 +120,46 @@ if __name__ == '__main__':
     install_requires, deps_link = parse_requirements('requirements.txt')
     extra_requires = {}
     all_requires = []
-    extra_requires['llm'], _ = parse_requirements('requirements/llm.txt')
-    extra_requires['aigc'], _ = parse_requirements('requirements/aigc.txt')
+    extra_requires['eval'], _ = parse_requirements('requirements/eval.txt')
+    extra_requires['swanlab'], _ = parse_requirements('requirements/swanlab.txt')
+    extra_requires['ray'], _ = parse_requirements('requirements/ray.txt')
     all_requires.extend(install_requires)
-    all_requires.extend(extra_requires['llm'])
-    all_requires.extend(extra_requires['aigc'])
+    all_requires.extend(extra_requires['eval'])
+    all_requires.extend(extra_requires['swanlab'])
+    all_requires.extend(extra_requires['ray'])
     extra_requires['all'] = all_requires
 
     setup(
-        name='ms-swift',
+        name='ms_swift',
         version=get_version(),
-        description=
-        'Swift: Scalable lightWeight Infrastructure for Fine-Tuning',
+        description='Swift: Scalable lightWeight Infrastructure for Fine-Tuning',
         long_description=readme(),
         long_description_content_type='text/markdown',
         author='DAMO ModelScope teams',
         author_email='contact@modelscope.cn',
-        keywords='python, petl, efficient tuners',
-        url='https://github.com/modelscope/swift',
-        packages=find_packages(exclude=('configs', 'demo')),
+        keywords=['transformers', 'LLM', 'lora', 'megatron', 'grpo', 'sft'],
+        url='https://github.com/modelscope/ms-swift',
+        packages=find_packages(exclude=('tests', 'tests.*')),
         include_package_data=True,
-        package_data={
-            '': ['*.h', '*.cpp', '*.cu'],
-        },
+        package_data={'': ['utils/*', 'dataset/data/*.*', 'config/*.json', 'loss_scale/config/*.json']},
+        python_requires='>=3.8.0',
         classifiers=[
             'Development Status :: 4 - Beta',
             'License :: OSI Approved :: Apache Software License',
             'Operating System :: OS Independent',
             'Programming Language :: Python :: 3',
-            'Programming Language :: Python :: 3.7',
             'Programming Language :: Python :: 3.8',
             'Programming Language :: Python :: 3.9',
             'Programming Language :: Python :: 3.10',
+            'Programming Language :: Python :: 3.11',
+            'Programming Language :: Python :: 3.12',
         ],
         license='Apache License 2.0',
         tests_require=parse_requirements('requirements/tests.txt'),
         install_requires=install_requires,
         extras_require=extra_requires,
-        entry_points={'console_scripts': ['swift=swift.cli.main:cli_main']},
+        entry_points={
+            'console_scripts': ['swift=swift.cli.main:cli_main', 'megatron=swift.cli._megatron.main:cli_main']
+        },
         dependency_links=deps_link,
         zip_safe=False)

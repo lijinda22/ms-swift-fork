@@ -1,164 +1,310 @@
-# Copyright (c) Alibaba, Inc. and its affiliates.
-
-import os
-import socket
-from bisect import bisect_right
-from typing import List, Optional, Tuple
-
+# Copyright (c) ModelScope Contributors. All rights reserved.
+import gc
+import hashlib
 import numpy as np
+import os
+import pickle
+import time
 import torch
 import torch.distributed as dist
-from torch.nn import Module
+import torch.nn.functional as F
+import uuid
+from contextlib import contextmanager
+from datasets.utils.filelock import FileLock
+from datetime import timedelta
+from modelscope.hub.utils.utils import get_cache_dir
+from transformers.utils import is_torch_cuda_available, is_torch_mps_available, is_torch_npu_available
+from typing import Any, Mapping, Optional, Union
 
-from .logger import get_logger, is_master
+from swift.utils import is_mp
+from .env import get_dist_setting, get_node_setting, is_dist, is_local_master, is_master
+from .logger import get_logger
 
 logger = get_logger()
 
 
-def is_on_same_device(model: torch.nn.Module) -> bool:
-    device_set = set(map(lambda p: p.device, model.parameters()))
-    return len(device_set) == 1
+def _find_local_mac() -> str:
+    mac = uuid.getnode()
+    mac_address = ':'.join(('%012x' % mac)[i:i + 2] for i in range(0, 12, 2))
+    return mac_address
 
 
-def _find_free_port() -> str:
-    # Copied from https://github.com/facebookresearch/detectron2/blob/main/detectron2/engine/launch.py # noqa: E501
-    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    # Binding to port 0 will cause the OS to find an available port for us
-    sock.bind(('', 0))
-    port = sock.getsockname()[1]
-    sock.close()
-    # NOTE: there is still a chance the port could be taken by other processes.
-    return port
-
-
-def get_model_info(model: Module, name: Optional[str] = None) -> str:
-    if name is None:
-        name = model.__class__.__name__
-
-    n_params = sum(p.numel() for p in model.parameters())
-    n_grads = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    n_buffers = sum(p.numel() for p in model.buffers())
-
-    n_params /= 1e6
-    n_grads /= 1e6
-    n_buffers /= 1e6
-    s = (f'{name}: '
-         f'{n_params:.4f}M Params ({n_grads:.4f}M Trainable '
-         f'[{100 * n_grads / n_params:.4f}%]), '
-         f'{n_buffers:.4f}M Buffers.')
-    return s
-
-
-def find_sub_module(module: torch.nn.Module,
-                    module_name: str) -> List[torch.nn.Module]:
-    _modules = list()
-    for name, sub_module in module.named_modules():
-        if not name:
-            continue
-        if name.endswith(module_name):
-            _modules.append(sub_module)
-    return _modules
-
-
-def get_dist_setting() -> Tuple[int, int, int, int]:
-    """return rank, local_rank, world_size, local_world_size"""
-    rank = int(os.getenv('RANK', -1))
-    local_rank = int(os.getenv('LOCAL_RANK', -1))
-    world_size = int(os.getenv('WORLD_SIZE', 1))
-    local_world_size = int(os.getenv('LOCAL_WORLD_SIZE', 1))
-    return rank, local_rank, world_size, local_world_size
-
-
-def is_local_master():
-    local_rank = get_dist_setting()[1]
-    return local_rank in {-1, 0}
-
-
-def is_dist():
-    """Determine if the training is distributed"""
-    rank, local_rank, _, _ = get_dist_setting()
-    return rank >= 0 and local_rank >= 0
-
-
-def is_mp() -> bool:
-    n_gpu = torch.cuda.device_count()
-    local_world_size = get_dist_setting()[3]
-    assert n_gpu % local_world_size == 0
-    if n_gpu // local_world_size >= 2:
-        return True
-    return False
-
-
-def is_ddp_plus_mp() -> bool:
-    if not is_dist():
-        return False
-    if not is_mp():
-        return False
-    logger.info('Using DDP + MP(device_map)')
-    return True
-
-
-def show_layers(model: Module, max_lines: Optional[int] = 20) -> None:
-    named_p = list(model.named_parameters())
-    for i, (n, p) in enumerate(named_p):
-        if max_lines is not None and i >= max_lines:
-            logger.info('...')
-            break
-        logger.info(
-            f'[{n}]: requires_grad={p.requires_grad}, dtype={p.dtype}, device={p.device}'
-        )
-
-
-def freeze_model_parameters(model: Module, freeze_parameters: float) -> None:
-    n_parameters = np.array([p.numel() for p in model.parameters()],
-                            dtype=np.int64)
-    n_freeze_parameters = int(np.sum(n_parameters) * freeze_parameters)
-    n_parameters_cs = np.cumsum(n_parameters)
-    idx = bisect_right(n_parameters_cs, n_freeze_parameters)
-    for _, p in zip(range(idx), model.parameters()):
-        p.requires_grad = False
-
-
-def activate_model_parameters(
-        model: Module, additional_trainable_parameters: List[int]) -> None:
-    if len(additional_trainable_parameters) == 0:
-        return
-    has_activate = False
-    for n, p in model.named_parameters():
-        for additional_tp in additional_trainable_parameters:
-            if n.startswith(additional_tp):
-                p.requires_grad = True
-                has_activate = True
-    if not has_activate:
-        logger.warning(
-            'len(additional_trainable_parameters) > 0 but no parameters are activated. '
-            f'additional_trainable_parameters: {additional_trainable_parameters}'
-        )
-
-
-def broadcast_string(string: Optional[str], buffer_size: int = 1024) -> str:
-    """String broadcasting in case of DDP
-    string: main rank: str
-        other rank: None or str(not use)
-    return: all rank: str
-    """
-    assert dist.is_initialized()
-    rank, local_rank, _, _ = get_dist_setting()
-    assert rank >= 0
-    if rank == 0:
-        assert string is not None
-        tensor = torch.tensor(
-            [ord(c) for c in string] + [0] * (buffer_size - len(string)),
-            dtype=torch.int64,
-            device=local_rank)
+def synchronize(device: Union[torch.device, str, int, None] = None):
+    if is_torch_npu_available():
+        torch.npu.synchronize(device)
+    elif is_torch_cuda_available():
+        torch.cuda.synchronize(device)
     else:
-        tensor = torch.zeros(buffer_size, dtype=torch.int64, device=local_rank)
-    dist.broadcast(tensor, 0)
-    first_zero = (tensor == 0).nonzero()[0].item()
-    res = tensor.tolist()[:first_zero]
-    return ''.join([chr(x) for x in res])
+        torch.cuda.synchronize(device)
 
 
 def time_synchronize() -> float:
-    torch.cuda.synchronize()
+    synchronize()
     return time.perf_counter()  # second
+
+
+_DISABLE_USE_BARRIER = False
+
+
+@contextmanager
+def disable_safe_ddp_context_use_barrier():
+    global _DISABLE_USE_BARRIER
+    _DISABLE_USE_BARRIER = True
+    try:
+        yield
+    finally:
+        _DISABLE_USE_BARRIER = False
+
+
+@contextmanager
+def safe_ddp_context(hash_id: Optional[str], use_barrier: bool = True):
+    if _DISABLE_USE_BARRIER:
+        use_barrier = False
+    if use_barrier and dist.is_initialized():
+        if is_dist():
+            if not is_master():
+                dist.barrier()
+            if not is_local_master():
+                # Compatible with multi-machine scenarios,
+                # where each machine uses different storage hardware.
+                dist.barrier()
+        yield
+        if is_dist():
+            if is_master():
+                dist.barrier()
+            if is_local_master():
+                dist.barrier()
+    elif hash_id is not None:
+        lock_dir = os.path.join(get_cache_dir(), 'lockers')
+        os.makedirs(lock_dir, exist_ok=True)
+        file_path = hashlib.sha256(hash_id.encode('utf-8')).hexdigest() + '.lock'
+        file_path = os.path.join(lock_dir, file_path)
+        with FileLock(file_path):
+            yield
+    else:
+        yield
+
+
+def get_device(local_rank: Optional[Union[str, int]] = None) -> str:
+    if local_rank is None:
+        local_rank = max(0, get_dist_setting()[1])
+    local_rank = str(local_rank)
+    if is_torch_npu_available():
+        device = 'npu:{}'.format(local_rank)
+    elif is_torch_mps_available():
+        device = 'mps:{}'.format(local_rank)
+    elif is_torch_cuda_available():
+        device = 'cuda:{}'.format(local_rank)
+    else:
+        device = 'cpu'
+
+    return device
+
+
+def get_current_device():
+    if is_torch_npu_available():
+        current_device = torch.npu.current_device()
+    elif is_torch_cuda_available():
+        current_device = torch.cuda.current_device()
+    elif is_torch_mps_available():
+        current_device = 'mps'
+    else:
+        current_device = 'cpu'
+    return current_device
+
+
+def get_torch_device():
+    if is_torch_cuda_available():
+        return torch.cuda
+    elif is_torch_npu_available():
+        return torch.npu
+    elif is_torch_mps_available():
+        return torch.mps
+    else:
+        return torch.cpu
+
+
+def set_device(local_rank: Optional[Union[str, int]] = None):
+    if local_rank is None:
+        local_rank = max(0, get_dist_setting()[1])
+    if is_torch_npu_available():
+        torch.npu.set_device(local_rank)
+    elif is_torch_cuda_available():
+        torch.cuda.set_device(local_rank)
+
+
+def get_device_count() -> int:
+    if is_torch_npu_available():
+        return torch.npu.device_count()
+    elif is_torch_cuda_available():
+        return torch.cuda.device_count()
+    else:
+        return 0
+
+
+def empty_cache():
+    if is_torch_npu_available():
+        torch.npu.empty_cache()
+    elif is_torch_mps_available():
+        torch.mps.empty_cache()
+    elif is_torch_cuda_available():
+        torch.cuda.empty_cache()
+
+
+def gc_collect() -> None:
+    gc.collect()
+    empty_cache()
+
+
+def get_last_valid_indices(attention_mask: torch.Tensor) -> torch.Tensor:
+    """
+    Get the last valid (non-padding) token position indices for each sample.
+
+    This function correctly handles sequences with different padding directions (left/right/none)
+    within the same batch by computing the last valid index for each sequence individually.
+
+    Args:
+        attention_mask: Attention mask [batch_size, seq_len] where 1=valid, 0=padding
+
+    Returns:
+        torch.Tensor: Indices of last valid positions [batch_size]
+
+    Examples:
+        >>> # Right padding
+        >>> attention_mask = torch.tensor([[1, 1, 1, 0, 0], [1, 1, 1, 1, 0]])
+        >>> get_last_valid_indices(attention_mask)
+        tensor([2, 3])
+
+        >>> # Left padding
+        >>> attention_mask = torch.tensor([[0, 0, 1, 1, 1], [0, 1, 1, 1, 1]])
+        >>> get_last_valid_indices(attention_mask)
+        tensor([4, 4])
+    """
+    seq_len = attention_mask.shape[1]
+
+    # Flip the mask horizontally to bring the last elements to the front.
+    # `argmax` will then find the index of the first '1', which corresponds to the last valid token.
+    last_valid_indices = torch.fliplr(attention_mask).argmax(dim=1)
+
+    # Convert the index from the right-to-left frame to the original left-to-right frame.
+    indices = seq_len - 1 - last_valid_indices
+
+    return indices
+
+
+class Serializer:
+
+    @staticmethod
+    def to_tensor(obj):
+        res = pickle.dumps(obj)
+        res = np.array([len(res)], dtype=np.int64).tobytes() + res
+        res = np.frombuffer(res, dtype=np.uint8).copy()
+        res = torch.from_numpy(res)
+        return res
+
+    @staticmethod
+    def from_tensor(obj):
+        if isinstance(obj, torch.Tensor):
+            obj = obj.cpu().numpy()
+        res = obj.tobytes()
+        buffer_size = np.frombuffer(res[:8], dtype=np.int64)[0]
+        res = res[8:]
+        return pickle.loads(res[:buffer_size])
+
+
+def set_default_ddp_config():
+    # It runs normally with Python as well.
+    rank, local_rank, _, _ = get_dist_setting()
+    if rank == -1 or local_rank == -1:
+        os.environ['NPROC_PER_NODE'] = '1'
+        os.environ['RANK'] = '0'
+        os.environ['LOCAL_RANK'] = '0'
+        os.environ['WORLD_SIZE'] = '1'
+        os.environ['LOCAL_WORLD_SIZE'] = '1'
+        os.environ['MASTER_ADDR'] = '127.0.0.1'
+        os.environ['MASTER_PORT'] = os.environ.get('MASTER_PORT', '29500')
+
+
+def init_process_group(backend: Optional[str] = None, timeout: int = 18000000):
+    if dist.is_initialized():
+        return
+    set_device()
+    if backend is None:
+        if is_torch_npu_available():
+            backend = 'hccl'
+        elif torch.cuda.is_available():
+            backend = 'nccl'
+        else:
+            backend = 'gloo'
+    timeout = timedelta(seconds=timeout)
+    dist.init_process_group(backend=backend, timeout=timeout)
+
+
+def check_shared_disk(error, cache_dir: Optional[str] = None):
+    nnodes = get_node_setting()[1]
+    if nnodes <= 1:
+        return True
+    assert dist.is_initialized()
+    if cache_dir is None:
+        cache_dir = os.path.join(get_cache_dir(), 'tmp')
+    os.makedirs(cache_dir, exist_ok=True)
+    tmp_path = os.path.join(cache_dir, 'check_shared_disk.tmp')
+    is_shared_disk = True
+
+    try:
+        with safe_ddp_context(None, True):
+            if is_master():
+                with open(tmp_path, 'w'):
+                    pass
+            if not os.path.exists(tmp_path):
+                is_shared_disk = False
+        shared_state = [None] * dist.get_world_size()
+        dist.all_gather_object(shared_state, is_shared_disk)
+    finally:
+        if is_master() and os.path.exists(tmp_path):
+            os.remove(tmp_path)
+    if not all(shared_state):
+        raise error
+
+
+def to_float_dtype(data: Any, dtype: torch.dtype) -> Any:
+    """Change the float inputs to a dtype"""
+    if isinstance(data, Mapping):
+        return type(data)({k: to_float_dtype(v, dtype) for k, v in data.items()})
+    elif isinstance(data, (tuple, list)):
+        return type(data)(to_float_dtype(v, dtype) for v in data)
+    elif isinstance(data, torch.Tensor) and torch.is_floating_point(data):
+        return data.to(dtype=dtype)
+    else:
+        return data
+
+
+def to_device(data: Any, device: Union[str, torch.device, int], non_blocking: bool = False) -> Any:
+    """Move inputs to a device"""
+    if isinstance(data, Mapping):
+        return type(data)({k: to_device(v, device, non_blocking) for k, v in data.items()})
+    elif isinstance(data, (tuple, list)):
+        return type(data)(to_device(v, device, non_blocking) for v in data)
+    elif isinstance(data, torch.Tensor):
+        return data.to(device=device, non_blocking=non_blocking)
+    else:
+        return data
+
+
+def get_generative_reranker_logits(lm_head_weight, tokenizer, hidden_states):
+    positive_token = os.environ.get('GENERATIVE_RERANKER_POSITIVE_TOKEN', 'yes')
+    negative_token = os.environ.get('GENERATIVE_RERANKER_NEGATIVE_TOKEN', 'no')
+    positive_token_id = tokenizer.convert_tokens_to_ids(positive_token)
+    negative_token_id = tokenizer.convert_tokens_to_ids(negative_token)
+    weight = lm_head_weight[[positive_token_id, negative_token_id]]
+    logits = F.linear(hidden_states, weight)
+    return logits[..., 0:1] - logits[..., 1:2]
+
+
+def get_max_reserved_memory() -> float:
+    devices = list(range(get_device_count())) if is_mp() else [None]
+    try:
+        mems = [get_torch_device().max_memory_reserved(device=device) for device in devices]
+    except AttributeError:
+        return 0  # fix mps
+    return sum(mems) / 1024**3

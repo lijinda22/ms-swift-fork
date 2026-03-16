@@ -1,5 +1,5 @@
-# Copyright (c) Alibaba, Inc. and its affiliates.
-from swift.ui.app import run_ui
+# Copyright (c) ModelScope Contributors. All rights reserved.
+from swift.ui import webui_main
 
 if __name__ == '__main__':
-    run_ui()
+    webui_main()

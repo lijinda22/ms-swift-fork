@@ -1,24 +1,29 @@
-# Copyright (c) Alibaba, Inc. and its affiliates.
+# Copyright (c) ModelScope Contributors. All rights reserved.
 import importlib.util
+import json
 import os
 import subprocess
 import sys
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
+
+from swift.utils import get_logger
+
+logger = get_logger()
 
 ROUTE_MAPPING: Dict[str, str] = {
+    'pt': 'swift.cli.pt',
     'sft': 'swift.cli.sft',
     'infer': 'swift.cli.infer',
-    'app-ui': 'swift.cli.app_ui',
     'merge-lora': 'swift.cli.merge_lora',
     'web-ui': 'swift.cli.web_ui',
     'deploy': 'swift.cli.deploy',
-    'dpo': 'swift.cli.dpo',
-    'export': 'swift.cli.export'
+    'rollout': 'swift.cli.rollout',
+    'rlhf': 'swift.cli.rlhf',
+    'sample': 'swift.cli.sample',
+    'export': 'swift.cli.export',
+    'eval': 'swift.cli.eval',
+    'app': 'swift.cli.app',
 }
-
-ROUTE_MAPPING.update(
-    {k.replace('-', '_'): v
-     for k, v in ROUTE_MAPPING.items()})
 
 
 def use_torchrun() -> bool:
@@ -33,10 +38,7 @@ def get_torchrun_args() -> Optional[List[str]]:
     if not use_torchrun():
         return
     torchrun_args = []
-    for env_key in [
-            'NPROC_PER_NODE', 'MASTER_PORT', 'NNODES', 'NODE_RANK',
-            'MASTER_ADDR'
-    ]:
+    for env_key in ['NPROC_PER_NODE', 'MASTER_PORT', 'NNODES', 'NODE_RANK', 'MASTER_ADDR']:
         env_val = os.getenv(env_key)
         if env_val is None:
             continue
@@ -44,18 +46,58 @@ def get_torchrun_args() -> Optional[List[str]]:
     return torchrun_args
 
 
-def cli_main() -> None:
+def prepare_config_args(argv):
+    for i in range(len(argv)):
+        if argv[i] == '--config':
+            if i + 1 >= len(argv):
+                raise ValueError('The `--config` argument requires a yaml file path.')
+            from omegaconf import DictConfig, ListConfig, OmegaConf
+            config = OmegaConf.load(argv[i + 1])
+
+            def parse_dict_config(cfg: DictConfig) -> Dict[str, Any]:
+                result = {}
+                for key, value in cfg.items():
+                    if isinstance(value, DictConfig):
+                        result[key] = json.dumps(OmegaConf.to_container(value))
+                    elif isinstance(value, ListConfig):
+                        result[key] = list(value)
+                    else:
+                        result[key] = value
+                return result
+
+            # Convert yaml to cmd line
+            cfg = parse_dict_config(config)
+            for key, value in cfg.items():
+                argv.append(f'--{key}')
+                if isinstance(value, list):
+                    argv.extend(value)
+                else:
+                    argv.append(str(value))
+
+            # Pop --config
+            argv.pop(i)
+            # Pop value of --config
+            argv.pop(i)
+            break
+
+
+def cli_main(route_mapping: Optional[Dict[str, str]] = None, is_megatron: bool = False) -> None:
+    route_mapping = route_mapping or ROUTE_MAPPING
     argv = sys.argv[1:]
-    method_name = argv[0]
+    method_name = argv[0].replace('_', '-')
     argv = argv[1:]
-    file_path = importlib.util.find_spec(ROUTE_MAPPING[method_name]).origin
+    file_path = importlib.util.find_spec(route_mapping[method_name]).origin
     torchrun_args = get_torchrun_args()
-    if torchrun_args is None or method_name not in ('sft', 'dpo'):
-        args = ['python', file_path, *argv]
+    prepare_config_args(argv)
+    python_cmd = sys.executable
+    if torchrun_args is None or (not is_megatron and method_name not in {'pt', 'sft', 'rlhf', 'infer'}):
+        args = [python_cmd, file_path, *argv]
     else:
-        args = ['torchrun', *torchrun_args, file_path, *argv]
+        args = [python_cmd, '-m', 'torch.distributed.run', *torchrun_args, file_path, *argv]
     print(f"run sh: `{' '.join(args)}`", flush=True)
-    subprocess.run(args)
+    result = subprocess.run(args)
+    if result.returncode != 0:
+        sys.exit(result.returncode)
 
 
 if __name__ == '__main__':

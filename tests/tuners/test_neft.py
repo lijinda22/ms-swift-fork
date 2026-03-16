@@ -1,15 +1,13 @@
 import os
 import shutil
 import tempfile
-import unittest
-
 import torch
-from modelscope import AutoModel, AutoTokenizer, Preprocessor
-from peft.utils import WEIGHTS_NAME
+import unittest
+from modelscope import AutoModel, Preprocessor
+from peft.utils import SAFETENSORS_WEIGHTS_NAME
 from transformers import PreTrainedModel
 
-from swift import LoRAConfig, Swift
-from swift.tuners import NEFTuneConfig
+from swift.tuners import LoRAConfig, NEFTuneConfig, Swift
 
 
 class TestNEFT(unittest.TestCase):
@@ -26,8 +24,7 @@ class TestNEFT(unittest.TestCase):
 
     def test_neft(self):
         model = AutoModel.from_pretrained('AI-ModelScope/bert-base-uncased')
-        preprocessor = Preprocessor.from_pretrained(
-            'damo/nlp_structbert_sentence-similarity_chinese-base')
+        preprocessor = Preprocessor.from_pretrained('damo/nlp_structbert_sentence-similarity_chinese-base')
         inputs = preprocessor('how are you')
         config = NEFTuneConfig()
 
@@ -40,7 +37,7 @@ class TestNEFT(unittest.TestCase):
         self.assertTrue(torch.allclose(t1, t3))
         self.assertFalse(torch.allclose(t1, t2))
         model.save_pretrained(self.tmp_dir)
-        bin_file = os.path.join(self.tmp_dir, 'pytorch_model.bin')
+        bin_file = os.path.join(self.tmp_dir, 'model.safetensors')
         self.assertTrue(os.path.isfile(bin_file))
         model2 = AutoModel.from_pretrained(self.tmp_dir)
 
@@ -49,19 +46,15 @@ class TestNEFT(unittest.TestCase):
         self.assertTrue(len(state_dict) > 0)
         for key in state_dict:
             self.assertTrue(key in state_dict2)
-            self.assertTrue(
-                all(
-                    torch.isclose(state_dict[key],
-                                  state_dict2[key]).flatten().detach().cpu()))
+            self.assertTrue(all(torch.isclose(state_dict[key], state_dict2[key]).flatten().detach().cpu()))
 
         shutil.rmtree(self.tmp_dir)
         PreTrainedModel.origin_save_pretrained = PreTrainedModel.save_pretrained
         delattr(PreTrainedModel, 'save_pretrained')
         model.save_pretrained(self.tmp_dir)
-        bin_file = os.path.join(self.tmp_dir, WEIGHTS_NAME)
+        bin_file = os.path.join(self.tmp_dir, SAFETENSORS_WEIGHTS_NAME)
         self.assertTrue(os.path.isfile(bin_file))
-        model_new = AutoModel.from_pretrained(
-            'AI-ModelScope/bert-base-uncased')
+        model_new = AutoModel.from_pretrained('AI-ModelScope/bert-base-uncased')
         model_new_2 = Swift.from_pretrained(model_new, self.tmp_dir)
 
         state_dict = model.state_dict()
@@ -69,16 +62,12 @@ class TestNEFT(unittest.TestCase):
         self.assertTrue(len(state_dict) > 0)
         for key in state_dict:
             self.assertTrue(key in state_dict2)
-            self.assertTrue(
-                all(
-                    torch.isclose(state_dict[key],
-                                  state_dict2[key]).flatten().detach().cpu()))
+            self.assertTrue(all(torch.isclose(state_dict[key], state_dict2[key]).flatten().detach().cpu()))
         PreTrainedModel.save_pretrained = PreTrainedModel.origin_save_pretrained
 
     def test_neft_lora(self):
         model = AutoModel.from_pretrained('AI-ModelScope/bert-base-uncased')
-        preprocessor = Preprocessor.from_pretrained(
-            'damo/nlp_structbert_sentence-similarity_chinese-base')
+        preprocessor = Preprocessor.from_pretrained('damo/nlp_structbert_sentence-similarity_chinese-base')
         inputs = preprocessor('how are you')
         config = NEFTuneConfig()
         config2 = LoRAConfig(target_modules=['query', 'key', 'value'])
@@ -92,12 +81,11 @@ class TestNEFT(unittest.TestCase):
         self.assertTrue(torch.allclose(t1, t3))
         self.assertFalse(torch.allclose(t1, t2))
         model.save_pretrained(self.tmp_dir)
-        bin_file = os.path.join(self.tmp_dir, 'c2', WEIGHTS_NAME)
+        bin_file = os.path.join(self.tmp_dir, 'c2', SAFETENSORS_WEIGHTS_NAME)
         self.assertTrue(os.path.isfile(bin_file))
-        bin_file = os.path.join(self.tmp_dir, 'c1', WEIGHTS_NAME)
+        bin_file = os.path.join(self.tmp_dir, 'c1', SAFETENSORS_WEIGHTS_NAME)
         self.assertTrue(not os.path.isfile(bin_file))
-        model_new = AutoModel.from_pretrained(
-            'AI-ModelScope/bert-base-uncased')
+        model_new = AutoModel.from_pretrained('AI-ModelScope/bert-base-uncased')
         t1 = model_new.embeddings.word_embeddings(inputs['input_ids'])
         model_new = Swift.from_pretrained(model_new, self.tmp_dir)
         model_new.train()
@@ -113,12 +101,7 @@ class TestNEFT(unittest.TestCase):
 
         state_dict = model.state_dict()
         state_dict2 = model_new.state_dict()
-        self.assertTrue(
-            len(state_dict) > 0
-            and all(['lora' in key for key in state_dict.keys()]))
+        self.assertTrue(len(state_dict) > 0 and all(['lora' in key for key in state_dict.keys()]))
         for key in state_dict:
             self.assertTrue(key in state_dict2)
-            self.assertTrue(
-                all(
-                    torch.isclose(state_dict[key],
-                                  state_dict2[key]).flatten().detach().cpu()))
+            self.assertTrue(all(torch.isclose(state_dict[key], state_dict2[key]).flatten().detach().cpu()))

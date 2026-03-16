@@ -15,9 +15,6 @@
 ## 🔁 贡献流程
 
 ### 我们需要什么
-
-- ROADMAP：我们为SWIFT提供了每个迭代的[ROADMAP](./ROADMAP.md)，贡献者可以查看我们的ROADMAP来了解我们的开发进度和规划。在**待分配**中的feature可以认领并开发。
-
 - 新技术和新模型：SWIFT需要支持更多的开源模型和数据集，或我们没有关注到的新技术，如果您对此有兴趣，可以提交PR给我们。
 - 技术布道：如果您对技术布道有兴趣，欢迎在任何网站上帮我们撰写教程文档或视频等，并将链接发给我们。
 - 社区供稿：您可以撰写和SWIFT有关的技术文章，并供稿给我们，我们审核通过后会在魔搭官方账号（知乎、公众号等）上进行发布，并属上您的名字。
@@ -32,11 +29,11 @@
 
 任何feature开发都在github上以先Fork后PR的形式进行。
 
-1. Fork：进入[SWIFT](https://github.com/modelscope/swift)页面后，点击**Fork按钮**执行。完成后会在您的个人组织下克隆出一个SWIFT代码库
+1. Fork：进入[ms-swift](https://github.com/modelscope/ms-swift)页面后，点击**Fork按钮**执行。完成后会在您的个人组织下克隆出一个SWIFT代码库
 
 2. Clone：将第一步产生的代码库clone到本地并**拉新分支**进行开发，开发中请及时点击**Sync Fork按钮**同步`main`分支，防止代码过期并冲突
 
-3. 提交PR：开发、测试完成后将代码推送到远程分支。在github上点击**Pull Requests页面**，新建一个PR，源分支选择您提交的代码分支，目标分支选择`modelscope/swift:main`分支
+3. 提交PR：开发、测试完成后将代码推送到远程分支。在github上点击**Pull Requests页面**，新建一个PR，源分支选择您提交的代码分支，目标分支选择`modelscope/ms-swift:main`分支
 
 4. 撰写描述：在PR中填写良好的feature描述是必要的，让Reviewers知道您的修改内容
 
@@ -66,14 +63,6 @@ SWIFT在PR提交后会进行两类测试：
 ### Running CI Tests
 
 在提交PR前，请保证您的开发代码已经受到了测试用例的保护。例如，对新功能的冒烟测试，或者各种边缘case的单元测试等。在代码review时Reviewers也会关注这一点。同时，也会有服务专门运行CI Tests，运行所有的测试用例，测试用例通过后代码才可以合并。
-
-另外，由于运行时间过长，我们跳过了部分重要测试，为保证您的逻辑是正确的，可以在本地执行该测试：
-
-```shell
-python tests/llm/test_run.py
-```
-
-请保证该测试可以正常通过。
 
 ## ✅ 资源支持
 

@@ -1,22 +1,16 @@
-# Copyright (c) Alibaba, Inc. and its affiliates.
+# Copyright (c) ModelScope Contributors. All rights reserved.
 import math
-
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-from einops import rearrange
 
-from swift.utils.logger import get_logger
+from swift.utils import get_logger
 
 logger = get_logger()
 
 
 def detach_tensors(feats):
     if type(feats) in [list, tuple]:
-        feats = [
-            detach_tensors(feat) if feat is not None else None
-            for feat in feats
-        ]
+        feats = [detach_tensors(feat) if feat is not None else None for feat in feats]
     elif isinstance(feats, dict):
         feats = {key: detach_tensors(val) for key, val in feats.items()}
     elif isinstance(feats, torch.Tensor):
@@ -62,8 +56,7 @@ def choose_weight_type(weight_type, dim):
 def get_weight_value(weight_type, scaling, x):
     if weight_type in ['gate']:
         scaling = torch.mean(torch.sigmoid(scaling(x)), dim=1).view(-1, 1, 1)
-    elif weight_type in ['scale', 'scale_channel'
-                         ] or weight_type.startswith('scalar'):
+    elif weight_type in ['scale', 'scale_channel'] or weight_type.startswith('scalar'):
         scaling = scaling
     else:
         scaling = None

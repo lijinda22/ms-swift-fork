@@ -9,43 +9,70 @@ Swift DOCUMENTATION
    :maxdepth: 2
    :caption: Get Started
 
-   GetStarted/快速使用.md
-   GetStarted/SWIFT安装.md
-   GetStarted/界面训练推理.md
-   GetStarted/使用tuners.md
-   GetStarted/ResTuning.md
-   GetStarted/在SWIFT内使用PEFT.md
-   GetStarted/部署指南.md
+   GetStarted/SWIFT-installation.md
+   GetStarted/Quick-start.md
+   GetStarted/Web-UI.md
 
 .. toctree::
    :maxdepth: 2
-   :caption: LLM Training and Inference Example
+   :caption: Instruction
 
-   LLM/自我认知微调最佳实践.md
-   LLM/Agent微调最佳实践.md
-   LLM/LLM推理文档.md
-   LLM/LLM微调文档.md
-   LLM/LLM人类对齐训练文档.md
-   LLM/VLLM推理加速与部署.md
-   LLM/支持的模型和数据集.md
-   LLM/自定义与拓展.md
-   LLM/命令行参数.md
-   LLM/Benchmark.md
+   Instruction/Command-line-parameters.md
+   Instruction/Pre-training-and-Fine-tuning.md
+   Instruction/GRPO/index.rst
+   Instruction/GKD.md
+   Instruction/RLHF.md
+   Instruction/Inference-and-deployment.md
+   Instruction/Sample.md
+   Instruction/Evaluation.md
+   Instruction/Export-and-push.md
+   Instruction/Ray.md
+   Instruction/Reinforced-Fine-tuning.md
+   Instruction/Agent-support.md
+   Instruction/Supported-models-and-datasets.md
+   Instruction/Use-tuners.md
+   Instruction/Frequently-asked-questions.md
 
 .. toctree::
    :maxdepth: 2
-   :caption: AIGC Training and Inference Example
+   :caption: Megatron-SWIFT
 
-   AIGC/AnimateDiff微调推理文档.md
+   Megatron-SWIFT/Quick-start.md
+   Megatron-SWIFT/Command-line-parameters.md
+   Megatron-SWIFT/LoRA-Training.md
+   Megatron-SWIFT/Multimodal-Model.md
+   Megatron-SWIFT/Mcore-Bridge.md
+   Megatron-SWIFT/GRPO.md
+   Megatron-SWIFT/GKD.md
+   Megatron-SWIFT/Ascend.md
+
 
 .. toctree::
    :maxdepth: 2
-   :caption: API Doc
+   :caption: Customization
 
-   Hub <api/swift.hub>
-   Trainer <api/swift.trainers>
-   Tuner <api/swift.tuners>
+   Customization/Architecture.md
+   Customization/Custom-model.md
+   Customization/Custom-dataset.md
 
+
+.. toctree::
+   :maxdepth: 2
+   :caption: Best Practices
+
+   BestPractices/GRPO.md
+   BestPractices/GRPO-Multi-Modal-Training.md
+   BestPractices/GRPO-Code-Training.md
+   BestPractices/Qwen3-Best-Practice.md
+   BestPractices/Qwen3-VL-Best-Practice.md
+   BestPractices/Qwen3_5-Best-Practice.md
+   BestPractices/MLLM-Registration.md
+   BestPractices/Embedding.md
+   BestPractices/Reranker.md
+   BestPractices/Rapidly-Training-VL-model.md
+   BestPractices/NPU-support.md
+   BestPractices/Metax-support.md
+   BestPractices/More-Best-Practices.md
 
 Indices and tables
 ==================

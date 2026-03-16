@@ -2,10 +2,7 @@ import os
 import shutil
 import tempfile
 import unittest
-
-from modelscope import Model
-
-from swift.hub.check_model import check_local_model_is_latest
+from modelscope import Model, check_local_model_is_latest
 
 
 class TestCheckModel(unittest.TestCase):
@@ -22,7 +19,5 @@ class TestCheckModel(unittest.TestCase):
         super().tearDown()
 
     def test_check_model(self):
-        model = Model.from_pretrained(
-            'damo/nlp_corom_sentence-embedding_chinese-base',
-            revision='v1.0.0')
+        model = Model.from_pretrained('damo/nlp_corom_sentence-embedding_chinese-base', revision='v1.0.0')
         self.assertFalse(check_local_model_is_latest(model.model_dir))

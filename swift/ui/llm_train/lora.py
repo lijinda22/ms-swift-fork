@@ -1,9 +1,8 @@
+# Copyright (c) ModelScope Contributors. All rights reserved.
+import gradio as gr
 from typing import Type
 
-import gradio as gr
-
-from swift.llm import MODEL_MAPPING
-from swift.ui.base import BaseUI
+from ..base import BaseUI
 
 
 class LoRA(BaseUI):
@@ -17,18 +16,6 @@ class LoRA(BaseUI):
                 'en': 'LoRA settings'
             },
         },
-        'lora_target_modules': {
-            'label': {
-                'zh': 'LoRA目标模块',
-                'en': 'LoRA target modules'
-            },
-            'info': {
-                'zh':
-                '设置LoRA目标模块，如训练所有Linear请改为ALL',
-                'en':
-                'Set the LoRA target modules, fill in ALL if train all Linears'
-            }
-        },
         'lora_rank': {
             'label': {
                 'zh': 'LoRA的秩',
@@ -37,50 +24,45 @@ class LoRA(BaseUI):
         },
         'lora_alpha': {
             'label': {
-                'zh': 'LoRA的alpha',
+                'zh': 'LoRA的缩放因子',
                 'en': 'The LoRA alpha'
             }
         },
-        'lora_dropout_p': {
+        'lora_dropout': {
             'label': {
-                'zh': 'LoRA的dropout',
+                'zh': 'LoRA的丢弃概率',
                 'en': 'The LoRA dropout'
+            }
+        },
+        'use_rslora': {
+            'label': {
+                'zh': '使用rsLoRA',
+                'en': 'Use rsLoRA'
+            }
+        },
+        'use_dora': {
+            'label': {
+                'zh': '使用DoRA',
+                'en': 'Use DoRA'
+            }
+        },
+        'lora_dtype': {
+            'label': {
+                'zh': 'LoRA部分的参数类型',
+                'en': 'The dtype of LoRA'
             }
         },
     }
 
     @classmethod
     def do_build_ui(cls, base_tab: Type['BaseUI']):
-        with gr.Accordion(elem_id='lora_tab', open=True):
+        with gr.TabItem(elem_id='lora_tab'):
             with gr.Blocks():
                 with gr.Row():
-                    lora_target_modules = gr.Textbox(
-                        elem_id='lora_target_modules',
-                        lines=1,
-                        scale=20,
-                        is_list=True)
+                    gr.Slider(elem_id='lora_rank', value=8, minimum=1, maximum=512, step=8, scale=2)
+                    gr.Slider(elem_id='lora_alpha', value=32, minimum=1, maximum=512, step=8, scale=2)
+                    gr.Textbox(elem_id='lora_dropout', scale=2)
                 with gr.Row():
-                    gr.Slider(
-                        elem_id='lora_rank',
-                        value=32,
-                        minimum=1,
-                        maximum=512,
-                        step=8)
-                    gr.Slider(
-                        elem_id='lora_alpha',
-                        value=8,
-                        minimum=1,
-                        maximum=512,
-                        step=8)
-                    gr.Textbox(elem_id='lora_dropout_p')
-
-            def update_lora(choice):
-                if choice is not None:
-                    return ' '.join(
-                        MODEL_MAPPING[choice]['lora_target_modules'])
-                return None
-
-            base_tab.element('model_type').change(
-                update_lora,
-                inputs=[base_tab.element('model_type')],
-                outputs=[lora_target_modules])
+                    gr.Dropdown(elem_id='lora_dtype', scale=2, value=None)
+                    gr.Checkbox(elem_id='use_rslora', scale=2)
+                    gr.Checkbox(elem_id='use_dora', scale=2)

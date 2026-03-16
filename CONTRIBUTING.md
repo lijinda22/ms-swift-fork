@@ -12,7 +12,6 @@ Please refer to our [Code of Conduct documentation](./CODE_OF_CONDUCT.md).
 
 ## 🔁 Contribution Process
 ### What We Need
-- ROADMAP: We provide a [ROADMAP](./ROADMAP.md) for each iteration of SWIFT, contributors can check our ROADMAP to understand our development progress and plans. Features in **To be Assigned** is available for all developers.
 - New Technologies and New Models: SWIFT needs to support more open-source models and datasets, or new technologies that we have not paid attention to. If you are interested please submit a PR to us.
 - Technical Propagation: If you are interested in technical propagation, you are welcome to help us write tutorials, documents or videos on any website, and send us the link.
 - Community Contribution: You can write technical articles related to SWIFT, and submit them to us. After review and approval, we will publish them on the official ModelScope accounts (Zhihu, WeChat, etc.), with your name assigned.
@@ -25,9 +24,9 @@ Please refer to our [Code of Conduct documentation](./CODE_OF_CONDUCT.md).
 ### Submitting PR (Pull Requests)
 
 Any feature development is carried out in the form of Fork and then PR on GitHub.
-1. Fork: Go to the [SWIFT](https://github.com/modelscope/swift) page and click the **Fork button**. After completion, a SWIFT code repository will be cloned under your personal organization.
+1. Fork: Go to the [ms-swift](https://github.com/modelscope/ms-swift) page and click the **Fork button**. After completion, a SWIFT code repository will be cloned under your personal organization.
 2. Clone: Clone the code repository generated in the first step to your local machine and **create a new branch** for development. During development, please click the **Sync Fork button** in time to synchronize with the `main` branch to prevent code expiration and conflicts.
-3. Submit PR: After development and testing, push the code to the remote branch. On GitHub, go to the **Pull Requests page**, create a new PR, select your code branch as the source branch, and the `modelscope/swift:main` branch as the target branch.
+3. Submit PR: After development and testing, push the code to the remote branch. On GitHub, go to the **Pull Requests page**, create a new PR, select your code branch as the source branch, and the `modelscope/ms-swift:main` branch as the target branch.
 
 4. Write Description: It is necessary to provide a good feature description in the PR, so that the reviewers know the content of your modification.
 5. Review: We hope that the code to be merged is concise and efficient, so we may raise some questions and discuss them. Please note that any issues raised in the review are aimed at the code itself, not at you personally. Once all issues are discussed and resolved, your code will be approved.
@@ -48,12 +47,6 @@ pre-commit run --all-files # Fix the errors reported by pre-commit until all che
 
 ### Running CI Tests
 Before submitting the PR, please ensure that your development code is protected by test cases, such as smoke tests for new features, or unit tests for various edge cases. Reviewers will also pay attention to this during code review. At the same time, there will be dedicated services running CI Tests, running all test cases, and the code can only be merged after the test cases pass.
-
-Additionally, since some important tests have been skipped due to long running time, to ensure that your logic is correct, you can run the test locally:
-```shell
-python tests/llm/test_run.py
-```
-Please make sure this test can pass normally.
 
 ## ✅ Hardware support
 

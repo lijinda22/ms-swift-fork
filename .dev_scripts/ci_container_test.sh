@@ -1,7 +1,7 @@
 if [ "$MODELSCOPE_SDK_DEBUG" == "True" ]; then
     # pip config set global.index-url https://pypi.tuna.tsinghua.edu.cn/simple
     pip install -r requirements/tests.txt -i https://mirrors.aliyun.com/pypi/simple/
-    git config --global --add safe.directory /swift
+    git config --global --add safe.directory /ms-swift
     git config --global user.email tmp
     git config --global user.name tmp.com
 
@@ -21,8 +21,12 @@ if [ "$MODELSCOPE_SDK_DEBUG" == "True" ]; then
     fi
 
     pip install -r requirements/framework.txt -U -i https://mirrors.aliyun.com/pypi/simple/
-    pip install -r requirements/llm.txt -U -i https://mirrors.aliyun.com/pypi/simple/
-    pip install diffusers decord einops -U -i https://mirrors.aliyun.com/pypi/simple/
+    pip install decord einops -U -i https://mirrors.aliyun.com/pypi/simple/
+    pip uninstall autoawq -y
+    pip install optimum
+    pip install diffusers
+    pip install "transformers<5.0"
+    # pip install autoawq -U --no-deps
 
     # test with install
     pip install .

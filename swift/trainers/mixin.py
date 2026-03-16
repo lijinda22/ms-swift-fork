@@ -1,649 +1,1262 @@
-# Copyright (c) Alibaba, Inc. and its affiliates.
+# Copyright (c) ModelScope Contributors. All rights reserved.
 # Part of the implementation is borrowed from huggingface/transformers.
-import os
-import re
-import shutil
-from pathlib import Path
-from types import MethodType
-from typing import Callable, Dict, List, Optional, Tuple, Union
-
+import collections
+import datasets
+import inspect
 import json
+import logging
 import numpy as np
+import os
+import random
+import re
 import safetensors
+import shutil
+import time
 import torch
+import torch.distributed as dist
+import torch.nn as nn
+import torch.utils.checkpoint
 import transformers
+import warnings
+from contextlib import contextmanager
+from copy import copy
 from datasets import Dataset as HfDataset
+from functools import partial, wraps
+from modelscope import check_local_model_is_latest
 from packaging import version
 from peft import PeftModel
-from torch import nn
-from torch.nn import Module
-from transformers import PreTrainedModel, PreTrainedTokenizerBase
-from transformers.data.data_collator import DataCollator
+from torch.utils.data import DataLoader
+from transformers import PreTrainedModel
+from transformers.integrations import is_deepspeed_zero3_enabled
 from transformers.modeling_utils import unwrap_model
-from transformers.trainer import ADAPTER_CONFIG_NAME  # noqa
-from transformers.trainer import (ADAPTER_SAFE_WEIGHTS_NAME,
-                                  ADAPTER_WEIGHTS_NAME, CONFIG_NAME,
-                                  PREFIX_CHECKPOINT_DIR, SAFE_WEIGHTS_NAME,
-                                  TRAINER_STATE_NAME, TRAINING_ARGS_NAME,
-                                  WEIGHTS_NAME, IntervalStrategy, Trainer,
-                                  TrainerCallback, is_peft_available)
-from transformers.trainer_utils import EvalPrediction
-from transformers.training_args import TrainingArguments
+from transformers.trainer import OPTIMIZER_NAME, PREFIX_CHECKPOINT_DIR, SCHEDULER_NAME, TRAINER_STATE_NAME, ParallelMode
+from transformers.trainer import Trainer as HfTrainer
+from transformers.trainer import reissue_pt_warnings
+from transformers.trainer_utils import IntervalStrategy
+from types import MethodType
+from typing import Callable, Dict, List, Optional
 
-from swift.hub import Repository
-from swift.hub.check_model import check_local_model_is_latest
+from swift.callbacks import callbacks_map
+from swift.dataloader import BatchSamplerShard, DataLoaderDispatcher, DataLoaderShard
+from swift.hub import get_hub
+from swift.loss import loss_map
+from swift.metrics import MeanMetric, compute_acc, eval_metrics_map
+from swift.model import get_llm_model, get_lm_head_model, save_checkpoint
+from swift.model.patcher import gather_sequence_parallel_outputs, revert_padding_free, transformers_seq_cls_forward
+from swift.optimizers import OptimizerCallback, optimizers_map
+from swift.sequence_parallel import SequenceParallelDispatcher, SequenceParallelSampler, sequence_parallel
+from swift.template import Template, update_generation_config_eos_token
+from swift.tuner_plugin import tuners_map
 from swift.tuners import SwiftModel
-from swift.utils import check_json_format, create_ms_repo, get_logger
-from swift.utils.constants import Invoke
-from .utils import (can_return_loss, find_labels, get_function,
-                    is_instance_of_ms_model)
+from swift.utils import (HfConfigFactory, copy_files_by_pattern, deep_getattr, get_current_device, get_logger,
+                         get_packed_seq_params, is_dist, is_mp, is_mp_ddp, ms_logger_context, seed_worker)
+from .arguments import TrainingArguments
+from .utils import (can_return_loss, dynamic_gradient_checkpointing, find_labels, get_function, get_resume_dir,
+                    is_instance_of_ms_model, patch_modelscope_hub_timeout, replace_index_file)
 
 logger = get_logger()
 
 
-def _push_to_hub(self: Repository,
-                 commit_message: str = 'Commit files to Modelscope Hub',
-                 **kwargs):
-    blocking = kwargs.get('blocking', True)
-    self.push(commit_message)
-    if not blocking:
-        # Compatible with transformers
-        return None, None
-    else:
-        return None
-
-
-class PushToMsHubMixin:
-    repo: Repository
-
-    def _add_patterns_to_file(self,
-                              file_name: str,
-                              patterns: List[str],
-                              commit_message: Optional[str] = None) -> None:
-        # Make sure we only do this on the main process
-        if not self.is_world_process_zero():
-            return
-        if isinstance(patterns, str):
-            patterns = [patterns]
-        if commit_message is None:
-            commit_message = f'Add `{patterns[0]}` patterns to {file_name}'
-
-        # Get current file content
-        repo_dir = self.repo.model_dir
-        file_path = os.path.join(repo_dir, file_name)
-        if os.path.exists(file_path):
-            with open(file_path, 'r', encoding='utf-8') as f:
-                current_content = f.read()
-        else:
-            current_content = ''
-        # Add the patterns to file
-        content = current_content
-        for pattern in patterns:
-            if pattern not in content:
-                if len(content) > 0 and not content.endswith('\n'):
-                    content += '\n'
-                content += f'{pattern}\n'
-
-        # Write the file if it has changed
-        if content != current_content:
-            with open(file_path, 'w', encoding='utf-8') as f:
-                logger.debug(f'Writing {file_name} file. Content: {content}')
-                f.write(content)
-        self.repo.push(commit_message)
-
-    def _add_patterns_to_gitignore(
-            self,
-            patterns: List[str],
-            commit_message: Optional[str] = None) -> None:
-        self._add_patterns_to_file('.gitignore', patterns, commit_message)
-
-    def _add_patterns_to_gitattributes(
-            self,
-            patterns: List[str],
-            commit_message: Optional[str] = None) -> None:
-        new_patterns = []
-        suffix = 'filter=lfs diff=lfs merge=lfs -text'
-        for pattern in patterns:
-            if suffix not in pattern:
-                pattern = f'{pattern} {suffix}'
-            new_patterns.append(pattern)
-        file_name = '.gitattributes'
-        if commit_message is None:
-            commit_message = f'Add `{patterns[0]}` patterns to {file_name}'
-        self._add_patterns_to_file(file_name, new_patterns, commit_message)
-
-    def init_hf_repo(self) -> None:
-        """init ms repo. Compatible with transformers>=4.34"""
-        self.init_git_repo(at_init=True)
-
-    def init_git_repo(self, at_init: bool = False) -> None:
-        if not self.is_world_process_zero():
-            return
-        if (os.path.exists(self.args.output_dir)
-                and os.listdir(self.args.output_dir)
-                and self.args.overwrite_output_dir and at_init):
-            # directory not empty.
-            shutil.rmtree(self.args.output_dir)
-        self.args.hub_model_id = create_ms_repo(self.args.hub_model_id,
-                                                self.args.hub_token,
-                                                self.args.hub_private_repo)
-        self.repo = Repository(self.args.output_dir, self.args.hub_model_id)
-        self._add_patterns_to_gitattributes(['*.safetensors', '*.bin', '*.pt'])
-        self.repo.push_to_hub = MethodType(_push_to_hub, self.repo)
-        self.repo.local_dir = self.repo.model_dir  # hf compatibility
-
-        # By default, ignore the checkpoint folders
-        if self.args.push_hub_strategy != 'all_checkpoints':
-            self._add_patterns_to_gitignore(
-                ['checkpoint-*/', 'tmp-checkpoint-*/'])
-
-        # Add 'runs/' to .gitignore, ignore tensorboard files
-        self._add_patterns_to_gitignore(['runs/'])
-
-        # Add '*.sagemaker' to .gitignore if using SageMaker
-        if os.environ.get('SM_TRAINING_ENV'):
-            self._add_patterns_to_gitignore(
-                ['*.sagemaker-uploading', '*.sagemaker-uploaded'],
-                'Add `*.sagemaker` patterns to .gitignore')
-
-        self.push_in_progress = None
-
-    def push_to_hub(self,
-                    commit_message: str = 'End of training',
-                    **kwargs) -> None:
-        # user calls manually `push_to_hub` with `self.args.push_to_hub = False`
-        create_model_card = kwargs.pop('create_model_card', None)
-        if not hasattr(self, 'repo'):
-            self.init_git_repo()
-        self.save_model(_internal_call=True)
-
-        if not self.is_world_process_zero():
-            return
-
-        self.repo.push_to_hub(commit_message, **kwargs)
-        # push separately the model card to be independant from the rest of the model
-        readme_path = os.path.join(self.args.output_dir, 'README.md')
-        if create_model_card is None:
-            create_model_card = not os.path.exists(readme_path)
-        if create_model_card and self.args.should_save:
-            model_name = kwargs.pop('model_name', None)
-            if model_name is None and self.args.should_save:
-                if self.args.hub_model_id is not None:
-                    model_name = self.args.hub_model_id.split('/')[-1]
-                else:
-                    model_name = os.path.basename(self.args.output_dir)
-            self.create_model_card(model_name=model_name, **kwargs)
-            self.repo.push_to_hub('update model card README.md', **kwargs)
-
-    def _push_from_checkpoint(self, checkpoint_folder: str) -> None:
-        """Compatible with transformers>=4.32"""
-        # Only push from one node.
-        if not self.is_world_process_zero(
-        ) or self.args.push_hub_strategy == 'end':
-            return
-        output_dir = self.args.output_dir
-        # To avoid a new synchronization of all model weights, we just copy the file from the checkpoint folder
-        modeling_files = [CONFIG_NAME, WEIGHTS_NAME, SAFE_WEIGHTS_NAME]
-        if is_peft_available():
-            modeling_files.extend([
-                ADAPTER_CONFIG_NAME, ADAPTER_WEIGHTS_NAME,
-                ADAPTER_SAFE_WEIGHTS_NAME
-            ])
-        for modeling_file in modeling_files:
-            if os.path.isfile(os.path.join(checkpoint_folder, modeling_file)):
-                shutil.copy(
-                    os.path.join(checkpoint_folder, modeling_file),
-                    os.path.join(output_dir, modeling_file))
-        # Saving the tokenizer is fast and we don't know how many files it may have spawned, so we resave it to be sure.
-        if self.tokenizer is not None:
-            self.tokenizer.save_pretrained(output_dir)
-        # Same for the training arguments
-        torch.save(self.args, os.path.join(output_dir, TRAINING_ARGS_NAME))
-
-        try:
-            if self.args.push_hub_strategy == 'checkpoint':
-                # Temporarily move the checkpoint just saved for the push
-                tmp_checkpoint = os.path.join(output_dir, 'last-checkpoint')
-                # We have to remove the "last-checkpoint" dir if it exists, otherwise the checkpoint is moved as a
-                # subfolder.
-                if os.path.isdir(tmp_checkpoint):
-                    shutil.rmtree(tmp_checkpoint)
-                shutil.move(checkpoint_folder, tmp_checkpoint)
-
-            if self.args.save_strategy == IntervalStrategy.STEPS:
-                commit_message = f'Training in progress, step {self.state.global_step}'
-            else:
-                commit_message = f'Training in progress, epoch {int(self.state.epoch)}'
-            if self.args.push_hub_strategy == 'push_best':
-                folder, checkpoint_name = os.path.split(checkpoint_folder)
-                checkpoint_name = checkpoint_name.replace(
-                    'tmp-checkpoint-', 'checkpoint-')
-                last_model_checkpoint = os.path.join(folder, checkpoint_name)
-                if last_model_checkpoint == self.state.best_model_checkpoint:
-                    self.repo.push_to_hub(
-                        commit_message=commit_message,
-                        blocking=False,
-                        auto_lfs_prune=True)
-            else:
-                self.repo.push_to_hub(
-                    commit_message=commit_message,
-                    blocking=False,
-                    auto_lfs_prune=True)
-        except Exception as e:
-            logger.error(f'Error when pushing to hub: {e}')
-        finally:
-            if self.args.push_hub_strategy == 'checkpoint':
-                # Move back the checkpoint to its place
-                shutil.move(tmp_checkpoint, checkpoint_folder)
-
-
 class SwiftMixin:
+    FLASH_CKPT_WAIT_TIMEOUT = 1800
 
     def __init__(self,
-                 model: Union[PreTrainedModel, Module] = None,
-                 args: TrainingArguments = None,
-                 data_collator: Optional[DataCollator] = None,
-                 train_dataset: Optional[HfDataset] = None,
-                 eval_dataset: Optional[Union[HfDataset,
-                                              Dict[str, HfDataset]]] = None,
-                 tokenizer: Optional[PreTrainedTokenizerBase] = None,
-                 model_init: Optional[Callable[[], PreTrainedModel]] = None,
-                 compute_metrics: Optional[Callable[[EvalPrediction],
-                                                    Dict]] = None,
-                 callbacks: Optional[List[TrainerCallback]] = None,
-                 optimizers: Tuple[torch.optim.Optimizer,
-                                   torch.optim.lr_scheduler.LambdaLR] = (None,
-                                                                         None),
-                 preprocess_logits_for_metrics: Optional[Callable[
-                     [torch.Tensor, torch.Tensor], torch.Tensor]] = None,
+                 model: PreTrainedModel,
+                 args: TrainingArguments,
+                 template: Template,
+                 train_dataset: HfDataset,
+                 eval_dataset: Optional[HfDataset] = None,
                  **kwargs) -> None:
-        check_model = kwargs.pop('check_model', True)
-        if check_model and hasattr(model, 'model_dir'):
-            check_local_model_is_latest(
-                model.model_dir,
-                user_agent={
-                    Invoke.KEY:
-                    Invoke.LOCAL_TRAINER,
-                    Invoke.THIRD_PARTY:
-                    kwargs.pop(Invoke.THIRD_PARTY, Invoke.SWIFT),
+        if not hasattr(train_dataset, '__len__') and args.dataloader_num_workers > 1:
+            args.dataloader_num_workers = 1
+            logger.warning('Using IterableDataset, setting args.dataloader_num_workers to 1.')
+        self.compute_loss_func = None  # Compatible with the older version of transformers
+        self.template = template
+
+        self.is_encoder_decoder = self.template.is_encoder_decoder
+        self.padding_free = self.template.padding_free
+        self.task_type = self.template.task_type
+        self.problem_type = getattr(model.config, 'problem_type', None)
+        if args.check_model and hasattr(model, 'model_dir'):
+            with ms_logger_context(logging.CRITICAL), patch_modelscope_hub_timeout():
+                config_info = self._collect_config_info()
+                config_info.update({
+                    'invoked_by': 'local_trainer',
+                    'third_party': 'swift',
+                    'trainer_class': self.__class__.__name__,
                 })
+                check_local_model_is_latest(model.model_dir, user_agent=config_info)
+        if eval_dataset is None and args:
+            if getattr(args, 'eval_dataset', None):
+                # Avoid trainer throwing errors.
+                eval_dataset = []
+            else:
+                args.evaluation_strategy = IntervalStrategy.NO
+                args.eval_strategy = IntervalStrategy.NO
 
-        # Compatible with transformers>=4.34
-        from swift.tuners import SwiftModel
-        is_quantized = getattr(model, 'is_quantized', False)
-        _hf_peft_config_loaded = getattr(model, '_hf_peft_config_loaded',
-                                         False)
-        use_swift = isinstance(model, SwiftModel)
-        if is_quantized and use_swift:
-            model._hf_peft_config_loaded = True
-        # mro
-        super().__init__(
-            model=model,
-            args=args,
-            data_collator=data_collator,
-            train_dataset=train_dataset,
-            eval_dataset=eval_dataset,
-            tokenizer=tokenizer,
-            model_init=model_init,
-            compute_metrics=compute_metrics,
-            callbacks=callbacks,
-            optimizers=optimizers,
-            preprocess_logits_for_metrics=preprocess_logits_for_metrics,
-            **kwargs)
-        if is_quantized and use_swift:
-            model._hf_peft_config_loaded = _hf_peft_config_loaded
+        def _get_mean_metric():
+            return MeanMetric(nan_value=None, device=args.device)
 
-        if get_function(model.__class__.forward) is not get_function(
-                model.forward):
+        self.custom_metrics = {
+            'train': collections.defaultdict(_get_mean_metric),
+            'eval': collections.defaultdict(_get_mean_metric)
+        }
+        self.hub = get_hub()
+
+        self.model_meta = model.model_meta
+        self.model_info = model.model_info
+
+        data_collator = self._get_data_collator(args, template)
+        kwargs.update(self.create_loss_and_eval_metric(args))
+        trainer_parameters = inspect.signature(HfTrainer.__init__).parameters
+        tokenizer_key = 'processing_class' if 'processing_class' in trainer_parameters else 'tokenizer'
+        kwargs[tokenizer_key] = template.tokenizer
+        with self.hub.patch_hub():
+            super().__init__(
+                model=model,
+                args=args,
+                data_collator=data_collator,
+                train_dataset=train_dataset,
+                eval_dataset=eval_dataset,
+                **kwargs)
+        # fix https://github.com/huggingface/transformers/pull/43919
+        if version.parse(transformers.__version__) >= version.parse('5.0.0'):
+            self.accelerator.gradient_state.plugin_kwargs['num_steps'] = 1
+        self._add_callbacks()
+        if get_function(model.__class__.forward) is not get_function(model.forward):
             self.label_names = find_labels(model)
             self.can_return_loss = can_return_loss(model)
+        self.label_names = self.label_names or ['labels']
+        self.start_time = time.time()
+        self._fix_gradient_checkpointing()
+        self._patch_tasks()
+        update_generation_config_eos_token(self.model.generation_config, self.template)
+        if getattr(self.model, 'origin_generation_config', None):
+            self.model.origin_generation_config.eos_token_id = self.model.generation_config.eos_token_id
+        if self.args.resume_only_model and self.args.ignore_data_skip:
+            # The weights have already been loaded outside the trainer,
+            # so reading train_state is skipped here.
+            self.args.resume_from_checkpoint = None
 
-    @staticmethod
-    def _create_configuration_file(model: Module, output_dir: str) -> None:
-        cfg = getattr(model, 'cfg', {})
-        configuration_path = os.path.join(output_dir, 'configuration.json')
-        new_cfg = {}
-        if os.path.exists(configuration_path):
-            with open(configuration_path, 'r', encoding='utf-8') as f:
-                new_cfg = json.load(f)
+    def _get_data_collator(self, args, template):
+        padding_to = template.max_length if args.tuner_type == 'longlora' else None
+        return partial(template.data_collator, padding_to=padding_to)
 
-        if 'framework' not in new_cfg:
-            new_cfg['framework'] = cfg.get('framework', 'pytorch')
-        if 'task' not in new_cfg:
-            new_cfg['task'] = cfg.get('task', 'text-generation')
-        with open(configuration_path, 'w', encoding='utf-8') as f:
-            json.dump(new_cfg, f, ensure_ascii=False, indent=4)
+    def _add_callbacks(self):
+        for callback in self.args.callbacks:
+            self.add_callback(callbacks_map[callback](self.args, self))
 
-    def _add_adapter_cfg(self, output_dir: str) -> None:
-        if not hasattr(self, 'sft_args'):
+    def _collect_config_info(self) -> Dict[str, str]:
+        """
+        Collects trainer-specific configuration details.
+
+        Subclasses can override this method to provide additional configuration
+        information for model compatibility verification.
+
+        Returns:
+            Dict[str, str]: Configuration parameters as key-value pairs.
+        """
+        if self.__class__.__name__ == 'Seq2SeqTrainer':
+            if not self.template.use_chat_template:
+                return {
+                    'seq2seq_mode': 'pt',
+                }
+            else:
+                return {
+                    'seq2seq_mode': 'sft',
+                }
+        return {}
+
+    @property
+    def tokenizer(self):
+        # compat transformers5.0
+        return self.processing_class
+
+    @contextmanager
+    def _patch_deepspeed_load_checkpoint(self):
+        from transformers import trainer
+        if not self.args.resume_from_checkpoint or not self.args.resume_only_model or not hasattr(
+                trainer, 'deepspeed_load_checkpoint'):
+            yield
             return
-        sft_args = self.sft_args
-        if sft_args.sft_type == 'full':
-            return
-        configuration_path = os.path.join(output_dir, 'configuration.json')
-        new_cfg = {}
-        if os.path.exists(configuration_path):
-            with open(configuration_path, 'r', encoding='utf-8') as f:
-                new_cfg = json.load(f)
+        origin_deepspeed_load_checkpoint = trainer.deepspeed_load_checkpoint
 
-        need_to_save = [
-            'model_id_or_path', 'model_revision', 'sft_type', 'tuner_backend',
-            'template_type', 'dtype', 'system'
-        ]
-        quantization_bit = sft_args.quantization_bit
-        if quantization_bit > 0:
-            need_to_save += [
-                'quantization_bit', 'bnb_4bit_comp_dtype',
-                'bnb_4bit_quant_type', 'bnb_4bit_use_double_quant'
-            ]
-        adapter_cfg = {}
-        for k in need_to_save:
-            adapter_cfg[k] = getattr(sft_args, k)
-        new_cfg['adapter_cfg'] = adapter_cfg
-        with open(configuration_path, 'w', encoding='utf-8') as f:
-            json.dump(new_cfg, f, ensure_ascii=False, indent=4)
+        def deepspeed_load_checkpoint(*args, **kwargs):
+            try:
+                return origin_deepspeed_load_checkpoint(*args, **kwargs)
+            except Exception as e:
+                logger.warning('Failed to call deepspeed_load_checkpoint function. '
+                               f'If `--resume_only_model true` is set, this warning can be ignored. {e}.')
 
-    def _save_sft_args(self, output_dir: str) -> None:
-        sft_args = getattr(self, 'sft_args', None)
-        if sft_args is None:
+        trainer.deepspeed_load_checkpoint = deepspeed_load_checkpoint
+
+        try:
+            yield
+        finally:
+            trainer.deepspeed_load_checkpoint = origin_deepspeed_load_checkpoint
+
+    def get_use_logits_to_keep(self, default_value: bool = True):
+        use_logits_to_keep = self.args.use_logits_to_keep
+        if use_logits_to_keep is None:
+            base_model = self.template.get_base_model(self.model)
+            use_logits_to_keep = (not self.model.model_meta.is_multimodal
+                                  and 'logits_to_keep' in inspect.signature(base_model.forward).parameters
+                                  and default_value)
+        logger.info_once(f'use_logits_to_keep: {use_logits_to_keep}')
+        return use_logits_to_keep
+
+    def _save_initial_model(self, output_dir):
+        # pissa/olora/lora-ga
+        model = unwrap_model(self.model)
+        if isinstance(model, PeftModel):
+            config = model.peft_config.get('default')
+            init_lora_weights = getattr(config, 'init_lora_weights', None)
+            if (isinstance(init_lora_weights, str)
+                    and any(s in init_lora_weights for s in ('pissa', 'olora', 'lora-ga'))):
+                config.init_lora_weights = True
+                model.save_pretrained(os.path.join(output_dir, 'initial_model'))
+                config.init_lora_weights = init_lora_weights
+
+    def _save_converted_model(self, output_dir):
+        # pissa/olora/lora-ga
+        model = unwrap_model(self.model)
+        if isinstance(model, PeftModel):
+            config = model.peft_config.get('default')
+            init_lora_weights = getattr(config, 'init_lora_weights', None)
+            if isinstance(init_lora_weights, str):
+                config = copy(config)
+                os.makedirs(os.path.join(output_dir, 'converted'), exist_ok=True)
+                if 'lora-ga' in init_lora_weights:
+                    try:
+                        from lora_ga.entrypoint import LoraGAContext
+                        with LoraGAContext(model):
+                            model.save_pretrained(
+                                os.path.join(output_dir, 'converted', 'default'),
+                                path_initial_model_for_weight_conversion=os.path.join(
+                                    os.path.dirname(output_dir), 'initial_model'),
+                            )
+                            model.peft_config['default'] = config
+                    except ImportError as e:
+                        error_message = """
+                        Since 'LoRA-GA' is not implemented by PEFT, you will need to install it directly from GitHub.
+                        Command: 'pip install git+https://github.com/lxline/LoRA-GA.git'.
+                        """
+                        logger.info(error_message)
+                        raise RuntimeError(error_message) from e
+                elif 'pissa' in init_lora_weights or 'olora' in init_lora_weights:
+                    model.save_pretrained(
+                        os.path.join(output_dir, 'converted', 'default'),
+                        path_initial_model_for_weight_conversion=os.path.join(
+                            os.path.dirname(output_dir), 'initial_model'),
+                    )
+                    model.peft_config['default'] = config
+
+    def _load_rng_state(self, *args, **kwargs):
+        if self.args.resume_only_model:
             return
-        fpath = os.path.join(output_dir, 'sft_args.json')
-        with open(fpath, 'w', encoding='utf-8') as f:
-            json.dump(
-                check_json_format(self.sft_args.__dict__),
-                f,
-                ensure_ascii=False,
-                indent=2)
-        return
+        return super()._load_rng_state(*args, **kwargs)
+
+    def _load_optimizer_and_scheduler(self, *args, **kwargs):
+        if self.args.resume_only_model:
+            return
+        super()._load_optimizer_and_scheduler(*args, **kwargs)
+        if is_mp_ddp():
+            # fix mp+ddp adamw
+            for v in self.optimizer.state.values():
+                if 'step' in v:
+                    # not on the same device
+                    device_set = set([t.device for t in v.values()]) - {v['step'].device, torch.device('cpu')}
+                    if len(device_set) >= 1:
+                        v['step'] = v['step'].to('cpu')
+
+    def _save_model(self, output_dir: Optional[str] = None, state_dict=None):
+        # model
+        supported_classes = (SwiftModel, PreTrainedModel, PeftModel)
+        supported_names = ('SentenceTransformer', )
+        safe_serialization = self.args.safe_serialization
+        use_flash_ckpt = self.args.use_flash_ckpt
+
+        if not isinstance(self.model, supported_classes) and self.model.__class__.__name__ not in supported_names:
+            if state_dict is None:
+                state_dict = self.model.state_dict()
+
+            _unwrap_model = unwrap_model(self.model)
+            if isinstance(_unwrap_model, supported_classes):
+                save_kwargs = {'state_dict': state_dict, 'max_shard_size': self.args.max_shard_size}
+                if isinstance(_unwrap_model, PeftModel):
+                    save_kwargs['selected_adapters'] = ['default']
+                if use_flash_ckpt:
+                    _unwrap_model.save_pretrained(
+                        output_dir,
+                        safe_serialization=False,
+                        save_function=self.flash_checkpointer.ckpt_agent.save,
+                        **save_kwargs)
+                else:
+                    _unwrap_model.save_pretrained(output_dir, safe_serialization=safe_serialization, **save_kwargs)
+            else:
+                logger.info('Trainer.model is not a `PreTrainedModel`, only saving its state dict.')
+                if use_flash_ckpt:
+                    self.flash_checkpointer.ckpt_agent.save(state_dict, os.path.join(output_dir, 'pytorch_model.bin'))
+                else:
+                    if safe_serialization:
+                        safetensors.torch.save_file(state_dict, os.path.join(output_dir, 'model.safetensors'))
+                    else:
+                        torch.save(state_dict, os.path.join(output_dir, 'pytorch_model.bin'))
+        elif is_instance_of_ms_model(self.model):
+            if use_flash_ckpt:
+                PreTrainedModel.save_pretrained(
+                    self.model,
+                    output_dir,
+                    state_dict=state_dict,
+                    safe_serialization=False,
+                    save_function=self.flash_checkpointer.ckpt_agent.save)
+            else:
+                # modelscope save_pretrained does not support safe_serialization
+                PreTrainedModel.save_pretrained(
+                    self.model, output_dir, state_dict=state_dict, safe_serialization=safe_serialization)
+        elif self.args.tuner_type in tuners_map:
+            tuners_map[self.args.tuner_type].save_pretrained(
+                self.model, output_dir, state_dict=state_dict, safe_serialization=safe_serialization)
+        else:
+            if self.model.__class__.__name__ != 'SentenceTransformer':
+                save_kwargs = {'state_dict': state_dict, 'max_shard_size': self.args.max_shard_size}
+                if isinstance(self.model, PeftModel):
+                    save_kwargs['selected_adapters'] = ['default']
+                if use_flash_ckpt:
+                    self.model.save_pretrained(
+                        output_dir,
+                        safe_serialization=False,
+                        save_function=self.flash_checkpointer.ckpt_agent.save,
+                        **save_kwargs)
+                else:
+                    self.model.save_pretrained(output_dir, safe_serialization=safe_serialization, **save_kwargs)
+            else:
+
+                @contextmanager
+                def save_context():
+                    save_pretrained = self.model[0].auto_model.save_pretrained
+                    _state_dict = {
+                        key[len('0.auto_model.'):] if 'auto_model' in key else key: value
+                        for key, value in state_dict.items()
+                    }
+                    self.model[0].auto_model.save_pretrained = partial(
+                        self.model[0].auto_model.save_pretrained, state_dict=_state_dict)
+                    yield
+                    self.model[0].auto_model.save_pretrained = save_pretrained
+
+                with save_context():
+                    if use_flash_ckpt:
+                        self.model.save_pretrained(
+                            output_dir,
+                            state_dict=state_dict,
+                            safe_serialization=False,
+                            save_function=self.flash_checkpointer.ckpt_agent.save)
+                    else:
+                        self.model.save_pretrained(output_dir, safe_serialization=safe_serialization)
+                        # copy sentencetransformers files
+                    copy_files_by_pattern(
+                        self.model.model_dir, output_dir, '*.py', exclude_patterns=['model.safetensors.index.json'])
+                    copy_files_by_pattern(
+                        self.model.model_dir, output_dir, '*.json', exclude_patterns=['model.safetensors.index.json'])
 
     def _save(self, output_dir: Optional[str] = None, state_dict=None):
         """Compatible with swift and peft"""
         # If we are executing this function, we are the process zero, so we don't check for that.
         output_dir = output_dir if output_dir is not None else self.args.output_dir
         os.makedirs(output_dir, exist_ok=True)
-        # configuration.json
-        model_dir = getattr(self.model, 'model_dir', None)
-        if model_dir is not None:
-            src_path = os.path.join(model_dir, 'configuration.json')
-            dst_path = os.path.join(output_dir, 'configuration.json')
-            if os.path.exists(src_path):
-                shutil.copy(src_path, dst_path)
-        else:
-            self._create_configuration_file(self.model, output_dir)
-        self._add_adapter_cfg(output_dir)
-        self._save_sft_args(output_dir)
-        # generation_config
-        generation_config = getattr(self.args, 'generation_config', None)
-        if generation_config is not None:
-            generation_config.save_pretrained(output_dir)
-        # model
-        supported_classes = (SwiftModel, PreTrainedModel, PeftModel)
-        save_safetensors = self.args.save_safetensors
-        if not isinstance(self.model, supported_classes):
-            if state_dict is None:
-                state_dict = self.model.state_dict()
-
-            _unwrap_model = unwrap_model(self.model)
-            if isinstance(_unwrap_model, supported_classes):
-                _unwrap_model.save_pretrained(
-                    output_dir,
-                    state_dict=state_dict,
-                    safe_serialization=save_safetensors)
-            else:
-                logger.info(
-                    'Trainer.model is not a `PreTrainedModel`, only saving its state dict.'
-                )
-                if save_safetensors:
-                    safetensors.torch.save_file(
-                        state_dict,
-                        os.path.join(output_dir, 'model.safetensors'))
-                else:
-                    torch.save(state_dict,
-                               os.path.join(output_dir, 'pytorch_model.bin'))
-        elif is_instance_of_ms_model(self.model):
-            PreTrainedModel.save_pretrained(
-                self.model,
-                output_dir,
-                state_dict=state_dict,
-                safe_serialization=save_safetensors)
-        else:
-            self.model.save_pretrained(
-                output_dir,
-                state_dict=state_dict,
-                safe_serialization=save_safetensors)
-        # tokenizer
-        if self.tokenizer is not None:
-            self.tokenizer.save_pretrained(output_dir)
+        self._save_model(output_dir, state_dict)
         # training_args.bin
         torch.save(self.args, os.path.join(output_dir, 'training_args.bin'))
-        # additional files
-        additional_files = getattr(self.args, 'additional_saved_files', [])
-        if model_dir is not None:
-            for file in additional_files:
-                src_path = os.path.join(model_dir, file)
-                dst_path = os.path.join(output_dir, file)
-                if os.path.exists(src_path):
-                    shutil.copy(src_path, dst_path)
+        self._save_converted_model(output_dir)
+        # args.json
+        args_path = os.path.join(os.path.dirname(output_dir), 'args.json')
+        if os.path.exists(args_path):
+            shutil.copy(args_path, os.path.join(output_dir, 'args.json'))
+        # predict.jsonl
+        predict_jsonl = os.path.join(os.path.dirname(output_dir), 'predict.jsonl')
+        if os.path.exists(predict_jsonl):
+            shutil.move(predict_jsonl, os.path.join(output_dir, 'predict.jsonl'))
 
-    def _save_checkpoint(self, model, trial, metrics=None):
-        self.state.last_model_checkpoint = os.path.join(
-            self.args.output_dir, f'checkpoint-{self.state.global_step}')
-        logger.info(
-            f'Saving model checkpoint to {self.state.last_model_checkpoint}')
-        if version.parse(transformers.__version__) >= version.parse(
-                '4.36') or not self.args.save_only_model:
-            return super()._save_checkpoint(model, trial, metrics)
+        is_adapter = isinstance(self.model, (SwiftModel, PeftModel))
+        # tokenizer
+        if not is_adapter:
+            additional_saved_files = self.model_meta.additional_saved_files
+            save_checkpoint(
+                None,
+                self.template.processor,
+                output_dir,
+                model_dirs=[self.model.model_dir],
+                additional_saved_files=additional_saved_files)
+            if getattr(self.model, 'origin_generation_config', None):
+                self.model.origin_generation_config.save_pretrained(output_dir)
+
+    def _rotate_flash_checkpoints(self, use_mtime=False, output_dir=None) -> None:
+        if (self.args.save_total_limit is None or self.args.save_total_limit <= 0):
+            return
+
+        last_step = self._get_last_checkpoint_step()
+
+        # Check if we should delete older checkpoint(s)
+        checkpoints_sorted = self._sorted_checkpoints(use_mtime=use_mtime, output_dir=output_dir)
+
+        valid_checkpoints = []
+        for path in checkpoints_sorted:
+            regex_match = re.match(f'.*{PREFIX_CHECKPOINT_DIR}-([0-9]+)', path)
+            if regex_match is not None and regex_match.groups() is not None:
+                step = int(regex_match.groups()[0])
+                if step <= last_step:
+                    valid_checkpoints.append(path)
+
+        if len(valid_checkpoints) <= self.args.save_total_limit:
+            return
+
+        # If save_total_limit=1 with load_best_model_at_end=True,
+        # we could end up deleting the last checkpoint, which
+        # should be avoided and allow resuming
+        save_total_limit = self.args.save_total_limit
+        if (self.state.best_model_checkpoint is not None and self.args.save_total_limit == 1
+                and valid_checkpoints[-1] != self.state.best_model_checkpoint):
+            save_total_limit = 2
+
+        number_of_checkpoints_to_delete = max(0, len(valid_checkpoints) - save_total_limit)
+        checkpoints_to_be_deleted = valid_checkpoints[:number_of_checkpoints_to_delete]
+        for checkpoint in checkpoints_to_be_deleted:
+            logger.info(f'Deleting older checkpoint [{checkpoint}] '
+                        f'due to save_total_limit = {self.args.save_total_limit}.')
+            shutil.rmtree(checkpoint, ignore_errors=True)
+
+    def get_last_checkpoint(self):
+        """
+        Get the path of the last complete checkpoint. Some latter directories
+        may not have the complete checkpoint because the asynchronous
+        persistence may not finish. The step in the `dlrover_latest.txt` is
+        the last step of complete checkpoint. We can get the path by the step.
+        """
+        step = self._get_last_checkpoint_step()
+        if step == 0:
+            return False
+        checkpoint_folder = f'{PREFIX_CHECKPOINT_DIR}-{step}'
+        ckpt_dir = os.path.join(self.args.output_dir, checkpoint_folder)
+        return ckpt_dir
+
+    def _get_last_checkpoint_step(self):
+        tracer_file = os.path.join(self.args.output_dir, 'dlrover_latest.txt')
+        if not os.path.exists(tracer_file):
+            return 0
+        with open(tracer_file, 'r') as f:
+            step = int(f.read())
+        return step
+
+    def get_resume_checkpoint(self):
+        """
+        Get the path of the last complete checkpoint. Some latter directories
+        may not have the complete checkpoint because the asynchronous
+        persistence may not finish. The step in the `dlrover_latest.txt` is
+        the last step of complete checkpoint. We can get the path by the step.
+        """
+        resume_dir = get_resume_dir(self.args.output_dir)
+        if resume_dir is None:
+            return None
+        tracer_file = os.path.join(resume_dir, 'dlrover_latest.txt')
+        if not os.path.exists(tracer_file):
+            return None
+        with open(tracer_file, 'r') as f:
+            step = int(f.read())
+        checkpoint_folder = f'{PREFIX_CHECKPOINT_DIR}-{step}'
+
+        ckpt_dir = os.path.join(resume_dir, checkpoint_folder)
+        with open(os.path.join(ckpt_dir, TRAINER_STATE_NAME), 'r', encoding='utf-8') as f:
+            train_state = json.load(f)
+        if train_state is not None and train_state.get('max_steps') == step:
+            return None
+        return ckpt_dir
+
+    def get_resume_checkpoint_until_find_ucp(self):
+        resume_dir = get_resume_dir(self.args.output_dir)
+        if resume_dir is None:
+            return None
+        tracer_file = os.path.join(resume_dir, 'ucp.txt')
+        if not os.path.exists(tracer_file):
+            step = 0
+            if step == 0:
+                return None
+        with open(tracer_file, 'r') as f:
+            step = int(f.read())
+        checkpoint_folder = f'{PREFIX_CHECKPOINT_DIR}-{step}'
+        ckpt_dir = os.path.join(resume_dir, checkpoint_folder)
+        return ckpt_dir
+
+    def wait_latest_checkpoint(self, timeout=None, max_steps=None):
+        """
+        Wait for the latest checkpoint.
+        Args:
+            timeout (second): The timeout to wait.
+        """
+        self.flash_checkpointer.async_save_engine.wait_latest_checkpoint(timeout, max_steps)
+
+    def _fix_zero3_gather_all_parameters(self) -> None:
+        if is_deepspeed_zero3_enabled() and not hasattr(self.deepspeed, '_zero3_consolidated_16bit_state_dict_origin'):
+            parameters = inspect.signature(self.deepspeed._zero3_consolidated_16bit_state_dict).parameters
+            if 'exclude_frozen_parameters' in parameters:
+
+                def _zero3_consolidated_16bit_state_dict(model, exclude_frozen_parameters=False):
+                    unwrapped = unwrap_model(model)
+                    exclude_frozen_parameters = False
+                    if isinstance(unwrapped, SwiftModel) and unwrapped.has_additional_modules:
+                        exclude_frozen_parameters = True
+                    if isinstance(unwrapped, PeftModel):
+                        exclude_frozen_parameters = True
+                    return model._zero3_consolidated_16bit_state_dict_origin(exclude_frozen_parameters)
+
+                self.deepspeed._zero3_consolidated_16bit_state_dict_origin = (
+                    self.deepspeed._zero3_consolidated_16bit_state_dict)
+                self.deepspeed._zero3_consolidated_16bit_state_dict = MethodType(_zero3_consolidated_16bit_state_dict,
+                                                                                 self.deepspeed)
+
+    def _save_checkpoint(self, *args, **kwargs):
+        self.state.last_model_checkpoint = os.path.join(self.args.output_dir, f'checkpoint-{self.state.global_step}')
+        self._fix_zero3_gather_all_parameters()
+
+        if self.args.use_flash_ckpt:
+            result = self._save_flash_checkpoint(*args, **kwargs)
         else:
-            return self._save_only_model(model, trial, metrics)
+            result = super()._save_checkpoint(*args, **kwargs)
+        logger.info(f'Saving model checkpoint to {self.state.last_model_checkpoint}')
+        return result
 
-    def _save_only_model(self, model, trial, metrics=None):
+    def _save_flash_checkpoint(self, model, trial, metrics=None):
+        from dlrover.trainer.torch.flash_checkpoint.hf_trainer import HfDdpCheckpointer, HfDeepSpeedCheckpointer
+        from transformers.trainer import DeepSpeedSchedulerWrapper
+        from transformers.trainer_utils import SaveStrategy
+        run_dir = self._get_output_dir(trial=trial)
+
+        torch_native_save = torch.save
+
         # Save model checkpoint
         checkpoint_folder = f'{PREFIX_CHECKPOINT_DIR}-{self.state.global_step}'
+        output_dir = os.path.join(run_dir, checkpoint_folder)
+
+        if not hasattr(self, 'flash_checkpointer'):
+            if self.is_deepspeed_enabled:
+                self.flash_checkpointer = HfDeepSpeedCheckpointer(self.model_wrapped, run_dir)
+            elif not self.is_deepspeed_enabled and not self.is_fsdp_enabled:
+                self.flash_checkpointer = HfDdpCheckpointer(run_dir)
+            else:
+                raise ValueError('Flash Checkpoint only supports DeepSpeed or DDP.')
 
         if self.hp_search_backend is None and trial is None:
             self.store_flos()
 
-        run_dir = self._get_output_dir(trial=trial)
-        output_dir = os.path.join(run_dir, checkpoint_folder)
+        torch.save = self.flash_checkpointer.ckpt_agent.save
         self.save_model(output_dir, _internal_call=True)
+        if self.is_deepspeed_enabled:
+            self.model_wrapped.save_checkpoint(output_dir)
 
-        # Determine the new best metric / best model checkpoint
-        if metrics is not None and self.args.metric_for_best_model is not None:
-            metric_to_check = self.args.metric_for_best_model
-            if not metric_to_check.startswith('eval_'):
-                metric_to_check = f'eval_{metric_to_check}'
-            metric_value = metrics[metric_to_check]
+        elif (self.args.should_save and not self.is_deepspeed_enabled and not self.is_fsdp_enabled):
+            # deepspeed.save_checkpoint above saves model/optim/sched
+            torch.save(
+                self.optimizer.state_dict(),
+                os.path.join(output_dir, OPTIMIZER_NAME),
+            )
 
-            operator = np.greater if self.args.greater_is_better else np.less
-            if (self.state.best_metric is None
-                    or self.state.best_model_checkpoint is None
-                    or operator(metric_value, self.state.best_metric)):
-                self.state.best_metric = metric_value
-                self.state.best_model_checkpoint = output_dir
+        # Save SCHEDULER & SCALER
+        is_deepspeed_custom_scheduler = (
+            self.is_deepspeed_enabled and not isinstance(self.lr_scheduler, DeepSpeedSchedulerWrapper))
+        if self.args.should_save and (not self.is_deepspeed_enabled or is_deepspeed_custom_scheduler):
+            with warnings.catch_warnings(record=True) as caught_warnings:
+                torch.save(
+                    self.lr_scheduler.state_dict(),
+                    os.path.join(output_dir, SCHEDULER_NAME),
+                )
+            reissue_pt_warnings(caught_warnings)
+        if self.args.save_strategy in [SaveStrategy.STEPS, SaveStrategy.EPOCH] and self.state.best_global_step:
+            best_checkpoint_folder = f'{PREFIX_CHECKPOINT_DIR}-{self.state.best_global_step}'
+            best_checkpoint_dir = os.path.join(run_dir, best_checkpoint_folder)
+
+            if os.path.exists(best_checkpoint_dir):
+                self.state.best_model_checkpoint = best_checkpoint_dir
 
         # Save the Trainer state
         if self.args.should_save:
-            self.state.save_to_json(
-                os.path.join(output_dir, TRAINER_STATE_NAME))
+            # Update `ExportableState` callbacks and `TrainerControl` state to where we are currently
+            from transformers.trainer_callback import ExportableState
+            for cb in [
+                    cb for cb in self.callback_handler.callbacks + [self.control] if isinstance(cb, ExportableState)
+            ]:
+                cb_name = cb.__class__.__name__
+                cb_state = cb.state()
+                if isinstance(self.state.stateful_callbacks[cb_name], list):
+                    self.state.stateful_callbacks[cb_name].append(cb_state)
+                else:
+                    self.state.stateful_callbacks[cb_name] = cb_state
+            self.state.save_to_json(os.path.join(output_dir, TRAINER_STATE_NAME))
+        # Save RNG state in non-distributed training
+        rng_states = {
+            'python': random.getstate(),
+            'numpy': np.random.get_state(),
+            'cpu': torch.random.get_rng_state(),
+        }
+        if torch.cuda.is_available():
+            if self.args.parallel_mode == ParallelMode.DISTRIBUTED:
+                # In non distributed, we save the global
+                # CUDA RNG state (will take care of DataParallel)
+                rng_states['cuda'] = torch.cuda.random.get_rng_state_all()
+            else:
+                rng_states['cuda'] = torch.cuda.random.get_rng_state()
 
-        # push to hub
+        # A process can arrive here before the process 0 has a chance to
+        # save the model, in which case output_dir may not yet exist.
+        os.makedirs(output_dir, exist_ok=True)
+
+        if self.args.world_size <= 1:
+            torch.save(rng_states, os.path.join(output_dir, 'rng_state.pth'))
+        else:
+            torch.save(
+                rng_states,
+                os.path.join(output_dir, f'rng_state_{self.args.process_index}.pth'),
+            )
+        if self.args.safe_serialization:
+            torch.save({'safe_serialization': True}, 'safe_serialization')
+            replace_index_file(output_dir)
+
+        torch.save = torch_native_save
+        if (self.state.global_step == self.state.max_steps):
+            success = self.flash_checkpointer.save_checkpoint_to_storage(self.state.global_step, True)
+        else:
+            success = self.flash_checkpointer.save_checkpoint_to_storage(self.state.global_step)
+
+        if not success:
+            logger.info(f'Skip saving the checkpoint of step {self.state.global_step} '
+                        'because the latest checkpoint is not finished.')
+            shutil.rmtree(output_dir, ignore_errors=True)
+
         if self.args.push_to_hub:
             self._push_from_checkpoint(output_dir)
 
         # Maybe delete some older checkpoints.
         if self.args.should_save:
-            self._rotate_checkpoints(use_mtime=True, output_dir=run_dir)
+            self._rotate_flash_checkpoints(use_mtime=True, output_dir=run_dir)
 
-    def _get_train_sampler(self) -> Optional[torch.utils.data.Sampler]:
-        train_sampler_random = self.args.train_sampler_random
-        if train_sampler_random:
-            return super()._get_train_sampler()
-        else:
-            return self._get_eval_sampler(self.train_dataset)
+    @staticmethod
+    @contextmanager
+    def _fix_grad_norm_nan():
+        from accelerate import Accelerator
+        origin_clip_grad_norm_ = Accelerator.clip_grad_norm_
 
-    def _load_from_checkpoint(self,
-                              resume_from_checkpoint: str,
-                              model=None) -> None:
-        if model is None:
-            model = self.model
-        if not isinstance(model, SwiftModel):
-            # Avoid throwing exceptions
-            return super()._load_from_checkpoint(resume_from_checkpoint, model)
+        def clip_grad_norm_(self, parameters, *args, **kwargs):
+            # If NaN occurs, ignore weight updates.
+            parameters = list(parameters)
+            grad_norm = origin_clip_grad_norm_(self, parameters, *args, **kwargs)
+            if isinstance(grad_norm, torch.Tensor) and grad_norm.isnan().item():
+                for p in parameters:
+                    p.grad = None
+            return grad_norm
 
-    def _sorted_checkpoints(self,
-                            output_dir=None,
-                            checkpoint_prefix=PREFIX_CHECKPOINT_DIR,
-                            use_mtime=False) -> List[str]:
-        ordering_and_checkpoint_path = []
-
-        glob_checkpoints = [
-            str(x) for x in Path(output_dir).glob(f'{checkpoint_prefix}-*')
-            if os.path.isdir(x)
-        ]
-
-        for path in glob_checkpoints:
-            if use_mtime:
-                ordering_and_checkpoint_path.append(
-                    (os.path.getmtime(path), path))
-            else:
-                regex_match = re.match(f'.*{checkpoint_prefix}-([0-9]+)', path)
-                if regex_match is not None and regex_match.groups(
-                ) is not None:
-                    ordering_and_checkpoint_path.append(
-                        (int(regex_match.groups()[0]), path))
-
-        checkpoints_sorted = sorted(ordering_and_checkpoint_path)
-        checkpoints_sorted = [
-            checkpoint[1] for checkpoint in checkpoints_sorted
-        ]
-        # Make sure we don't delete the best model.
-        if (self.state.best_model_checkpoint is not None and str(
-                Path(self.state.best_model_checkpoint)) in checkpoints_sorted):
-            best_model_index = checkpoints_sorted.index(
-                str(Path(self.state.best_model_checkpoint)))
-            for i in range(best_model_index, len(checkpoints_sorted) - 2):
-                checkpoints_sorted[i], checkpoints_sorted[
-                    i + 1] = checkpoints_sorted[i + 1], checkpoints_sorted[i]
-        return checkpoints_sorted
-
-    def _load_best_model(self):
-        # Compatible with transformers>=4.35 (deepspeed)
+        Accelerator.clip_grad_norm_ = clip_grad_norm_
         try:
+            yield
+        finally:
+            Accelerator.clip_grad_norm_ = origin_clip_grad_norm_
+
+    def _patch_tasks(self):
+        if isinstance(self.model, PeftModel):
+            model = self.model.model
+        else:
             model = self.model
-            if isinstance(model, SwiftModel):
-                logger.info(
-                    f'Loading best model from {self.state.best_model_checkpoint} (score: {self.state.best_metric}).'
-                )
-                adapters = model.adapters
-                for adapter_name in adapters.keys():
-                    sub_folder = os.path.join(self.state.best_model_checkpoint,
-                                              adapter_name)
-                    state_dict = SwiftModel.load_state_file(
-                        sub_folder, device='cpu')
-                    if state_dict is not None:
-                        self.model.load_state_dict(
-                            state_dict,
-                            strict=False,
-                            adapter_name=adapter_name)
-                state_dict = SwiftModel.load_state_file(
-                    self.state.best_model_checkpoint, device='cpu')
-                if state_dict is not None:
-                    self.model.load_state_dict(
-                        state_dict, strict=False, adapter_name='default')
+        task_type = self.task_type
+        sp_enabled = self.template.sequence_parallel_size > 1
+        pf_enabled = bool(self.template.padding_free)
+        padding_side = 'left' if pf_enabled else self.template.padding_side
+
+        if 'SentenceTransformer' in model.__class__.__name__:
+
+            def forward_transformer(transformer, features: Dict[str, torch.Tensor],
+                                    **kwargs) -> Dict[str, torch.Tensor]:
+                trans_features = {
+                    key: value
+                    for key, value in features.items()
+                    if key in ['input_ids', 'attention_mask', 'token_type_ids', 'inputs_embeds', 'position_ids']
+                }
+
+                outputs = transformer.auto_model(**trans_features, **kwargs, return_dict=True)
+                token_embeddings = outputs[0]
+                features['token_embeddings'] = token_embeddings
+
+                if transformer.auto_model.config.output_hidden_states and 'hidden_states' in outputs:
+                    features['all_layer_embeddings'] = outputs['hidden_states']
+
+                return features
+
+            from sentence_transformers.models import Transformer
+            if isinstance(model[0], Transformer):
+                model[0].forward = MethodType(forward_transformer, model[0])
+
+            def forward_sentence_transformer(sentence_transformer, **kwargs) -> Dict[str, torch.Tensor]:
+                input = kwargs
+                kwargs = {}
+                for idx, (module_name, module) in enumerate(sentence_transformer.named_children()):
+                    from sentence_transformers.models import Router
+                    if isinstance(module, Router):
+                        module_kwargs = kwargs
+                    else:
+                        module_kwarg_keys = []
+                        if sentence_transformer.module_kwargs is not None:
+                            module_kwarg_keys = sentence_transformer.module_kwargs.get(module_name, [])
+                        module_kwargs = {
+                            key: value
+                            for key, value in kwargs.items() if key in module_kwarg_keys or (
+                                hasattr(module, 'forward_kwargs') and key in module.forward_kwargs)
+                        }
+                    output = module(input, **module_kwargs)
+                    if idx == 0 and self.template.padding_free:
+                        output = revert_padding_free(output, input, padding_side)
+                    input = output
+                return {'last_hidden_state': input['sentence_embedding']}
+
+            model.forward = MethodType(forward_sentence_transformer, model)
+        else:
+
+            def _register_llm_hooks_in_order(llm_model: nn.Module, hooks: List[Callable]):
+                # hooks are provided in desired execution order.
+                # We use prepend=True and register in reverse to preserve the order.
+                for hook in reversed(hooks):
+                    llm_model.register_forward_hook(hook, with_kwargs=True, prepend=True)
+
+            def _get_hook_target_model(task_type_: str) -> nn.Module:
+                # For embedding, we hook on the LM-head model because embedding outputs are typically
+                # produced from `output.logits` by `patch_output_normalizer` (registered on LM-head model).
+                if task_type_ == 'embedding':
+                    return get_lm_head_model(self.model, model_meta=self.model.model_meta)
+                return get_llm_model(self.model, model_meta=self.model.model_meta)
+
+            # --- seq_cls / reranker / generative_reranker / embedding unified pipeline ---
+            if task_type in {'seq_cls', 'reranker', 'generative_reranker', 'embedding'}:
+                llm_model = _get_hook_target_model(task_type)
+
+                hooks: List[Callable] = []
+
+                if sp_enabled:
+
+                    def sp_gather_hook(module, args, input, output):
+                        return gather_sequence_parallel_outputs(output)
+
+                    hooks.append(sp_gather_hook)
+
+                if pf_enabled:
+                    if sp_enabled:
+
+                        def revert_padding_free_hook(module, args, input, output):
+                            # Use full packed position ids cached by sequence_parallel.prepare_inputs
+                            position_ids = sequence_parallel.real_position_ids
+                            tmp_input = {'position_ids': position_ids}
+                            return revert_padding_free(output, tmp_input, padding_side)
+                    else:
+
+                        def revert_padding_free_hook(module, args, input, output):
+                            return revert_padding_free(output, input, padding_side)
+
+                    hooks.append(revert_padding_free_hook)
+
+                if hooks:
+                    _register_llm_hooks_in_order(llm_model, hooks)
+
+                # wrappers for seq_cls / reranker (pooling/head must see gathered/reverted outputs)
+                if task_type in {'seq_cls', 'reranker'} and (sp_enabled or pf_enabled):
+                    lm_head_model = get_lm_head_model(self.model, model_meta=self.model.model_meta)
+
+                    if task_type == 'seq_cls':
+
+                        @wraps(model.forward.__func__)
+                        def seq_cls_forward(model, *args, **kwargs):
+                            sp_kwargs = dict(kwargs)
+
+                            def inner_forward(*args, **_kwargs):
+                                return llm_model(*args, **_kwargs)
+
+                            return transformers_seq_cls_forward(
+                                lm_head_model,
+                                *args,
+                                origin_forward=inner_forward,
+                                padding_side=padding_side,
+                                **sp_kwargs,
+                            )
+
+                        model.forward = MethodType(seq_cls_forward, model)
+                    else:
+
+                        @wraps(model.forward.__func__)
+                        def reranker_forward(model, *args, **kwargs):
+                            sp_kwargs = dict(kwargs)
+
+                            def inner_forward(*args, **_kwargs):
+                                return llm_model(*args, **_kwargs)
+
+                            padding_free_fn = getattr(model, 'padding_free_fn', None)
+                            if callable(padding_free_fn):
+                                output = inner_forward(*args, **sp_kwargs)
+                                return padding_free_fn(output, sp_kwargs, padding_side)
+
+                            return transformers_seq_cls_forward(
+                                lm_head_model,
+                                *args,
+                                origin_forward=inner_forward,
+                                padding_side=padding_side,
+                                **sp_kwargs,
+                            )
+
+                        model.forward = MethodType(reranker_forward, model)
+
+    def _fix_gradient_checkpointing(self):
+        # fix use_reentrant
+        if hasattr(torch.utils.checkpoint, '_old_checkpoint'):  # avoid double patching
+            return
+        args = self.args
+        if args.gradient_checkpointing_kwargs:
+            use_reentrant_ = args.gradient_checkpointing_kwargs.get('use_reentrant')
+        else:
+            use_reentrant_ = None
+        if use_reentrant_ is None:
+            if is_dist() and not self.is_deepspeed_enabled and not self.is_fsdp_enabled:
+                use_reentrant_ = False
             else:
-                super()._load_best_model()
-        except ValueError as e:
-            logger.warning(e)
+                use_reentrant_ = True
+        logger.info(f'use_reentrant: {use_reentrant_}')
+        _old_checkpoint = torch.utils.checkpoint.checkpoint
+
+        @wraps(_old_checkpoint)
+        def _new_checkpoint(*args, use_reentrant=None, **kwargs):
+            return _old_checkpoint(*args, use_reentrant=use_reentrant_, **kwargs)
+
+        torch.utils.checkpoint._old_checkpoint = _old_checkpoint
+        torch.utils.checkpoint.checkpoint = _new_checkpoint
+        try:
+            # Fix the old version of transformers.
+            import transformers.modeling_utils
+            transformers.modeling_utils.checkpoint = _new_checkpoint
+        except (ImportError, AttributeError):
+            pass
+
+    def _prepare_gradient_checkpointing(self, model) -> None:
+        args = self.args
+        HfConfigFactory.set_model_config_attr(model, 'use_cache', False)
+        if args.gradient_checkpointing or args.vit_gradient_checkpointing:
+            dynamic_gradient_checkpointing(model, args.vit_gradient_checkpointing)
+        gc_kwargs = {}
+        parameters = inspect.signature(model.gradient_checkpointing_enable).parameters
+        if 'gradient_checkpointing_kwargs' in parameters:
+            gc_kwargs['gradient_checkpointing_kwargs'] = args.gradient_checkpointing_kwargs
+        if args.gradient_checkpointing:
+            model.gradient_checkpointing_enable(**gc_kwargs)
+            model.enable_input_require_grads()
+
+        model_meta = model.model_meta
+        model_arch = model_meta.model_arch
+        if model_meta.is_multimodal and model_arch:
+            for vision_tower_name in model_arch.vision_tower:
+                vision_tower = deep_getattr(model, vision_tower_name)
+                if hasattr(vision_tower, 'enable_input_require_grads'):
+                    try:
+                        if args.vit_gradient_checkpointing:
+                            vision_tower.gradient_checkpointing_enable(**gc_kwargs)
+                            vision_tower.enable_input_require_grads()
+                        else:
+                            vision_tower.gradient_checkpointing_disable()
+                            vision_tower.disable_input_require_grads()
+                    except (NotImplementedError, AttributeError) as e:
+                        logger.warning(f'prepare gradient_checkpointing failed: {e}')
+        # Avoid vit_gradient_checkpointing being overwritten by transformers.Trainer.gradient_checkpointing_enable.
+        self.args.gradient_checkpointing = False
+
+    def train(self, *args, **kwargs):
+        if self.model_meta.is_multimodal:
+            models = []
+            for model_name in ['model', 'ref_model', 'value_model', 'teacher_model']:
+                model = getattr(self, model_name, None)
+                if isinstance(model, nn.Module):
+                    models.append(model)
+
+            reward_model = getattr(self, 'reward_model', None)
+            if reward_model is not None:
+                if isinstance(reward_model, list):
+                    models.extend([m for m in reward_model if isinstance(m, nn.Module)])
+                elif isinstance(reward_model, nn.Module):
+                    models.append(reward_model)
+
+            models = list(set(self.accelerator.unwrap_model(model) for model in models))  # Deduplicate
+            self.template.register_post_encode_hook(models)
+            logger.info(f'Successfully registered post_encode hook: {[model.__class__.__name__ for model in models]}.')
+        self._save_initial_model(self.args.output_dir)
+
+        # gradient_checkpointing
+        gradient_checkpointing = self.args.gradient_checkpointing
+        self._prepare_gradient_checkpointing(self.accelerator.unwrap_model(self.model))
+        with self.hub.patch_hub(), self._fix_grad_norm_nan(), self._patch_skip_first_batches(
+        ), self._patch_deepspeed_load_checkpoint():
+            res = super().train(*args, **kwargs)
+        self.template.remove_post_encode_hook()
+        self.args.gradient_checkpointing = gradient_checkpointing  # recover
+        return res
+
+    def push_to_hub(self, *args, **kwargs):
+        with self.hub.patch_hub():
+            return super().push_to_hub(*args, **kwargs)
+
+    @staticmethod
+    def compute_custom_metrics(metrics, key_prefix: str = ''):
+        logs = {}
+        # Synchronize keys to avoid getting stuck.
+        if dist.is_initialized():
+            all_keys = [None] * dist.get_world_size()
+            dist.all_gather_object(all_keys, list(metrics.keys()))
+            for key in set().union(*all_keys):
+                if key not in metrics:
+                    metrics[key]
+
+        for k, metric in sorted(metrics.items()):
+            k = f'{key_prefix}{k}'
+            value = metric.compute()
+            metric.reset()
+            if isinstance(value, dict):
+                if len(value) == 1:
+                    val = list(value.values())[0]
+                    logs[k] = val
+                else:
+                    for k_suffix, val in value.items():
+                        new_k = f'{k}_{k_suffix}'
+                        logs[new_k] = val
+            else:
+                logs[k] = value
+        for k in list(logs.keys()):
+            if logs[k] is None:
+                logs.pop(k)
+        return logs
+
+    def log(self, logs: Dict[str, float], *args, **kwargs) -> None:
+        mode = 'train' if self.model.training else 'eval'
+        metrics = self.custom_metrics[mode]
+        prefix = 'eval_' if mode == 'eval' else ''
+        logs.update(self.compute_custom_metrics(metrics, prefix))
+        return super().log(logs, *args, **kwargs)
 
     def _maybe_log_save_evaluate(self, tr_loss, *args, **kwargs):
-        if self.control.should_log:
+        if self.control.should_log and self.state.global_step > self._globalstep_last_logged:
             self.control.should_log = False
-            logs: Dict[str, float] = {}
-            metrics_log = {'loss': tr_loss}  # loss first
-            if hasattr(self, '_custom_metrics'):
-                metrics_log.update(self._custom_metrics)
-                self._custom_metrics = {}
-            for k, v in metrics_log.items():
-                # all_gather + mean() to get average loss over all processes
-                v_scalar = self._nested_gather(v).mean().item()
-                if k == 'loss':
-                    self._total_loss_scalar += v_scalar
-                logs[k] = round(
-                    v_scalar /
-                    (self.state.global_step - self._globalstep_last_logged), 8)
-            if version.parse(
-                    transformers.__version__) >= version.parse('4.38'):
-                grad_norm = args[0]
-                if isinstance(grad_norm, torch.Tensor):
-                    grad_norm = grad_norm.item()
-                if grad_norm is not None:
-                    logs['grad_norm'] = grad_norm
-            logs['learning_rate'] = self._get_learning_rate()
 
+            # all_gather + mean() to get average loss over all processes
+            if version.parse(transformers.__version__) >= version.parse('5.2.0'):
+                from transformers.trainer_pt_utils import nested_gather
+                tr_loss_scalar = nested_gather(tr_loss, self.args.parallel_mode).mean().item()
+            else:
+                tr_loss_scalar = self._nested_gather(tr_loss).mean().item()
+            loss = tr_loss_scalar / (self.state.global_step - self._globalstep_last_logged)
+            logs: Dict[str, float] = {'loss': loss}  # loss first
+            if version.parse(transformers.__version__) >= version.parse('4.38'):
+                grad_norm = args[0]
+                if grad_norm is not None:
+                    logs['grad_norm'] = grad_norm.item() if isinstance(grad_norm, torch.Tensor) else grad_norm
+            logs['learning_rate'] = self._get_learning_rate()
             tr_loss -= tr_loss
+            self._total_loss_scalar += tr_loss_scalar
             self._globalstep_last_logged = self.state.global_step
             self.store_flos()
             self.log(logs)
+
+        if self.args.eval_use_evalscope and self.control.should_evaluate:
+            try:
+                self._evalscope_eval()
+            except Exception as e:
+                logger.warning(f'Failed to call EvalScope evaluation function: {e}.')
+
+            if not self.eval_dataset:
+                self.control.should_evaluate = False
         super()._maybe_log_save_evaluate(tr_loss, *args, **kwargs)
 
-    def create_optimizer(self):
-        opt_model = self.model
+    def create_loss_and_eval_metric(self, args):
+        res = {}
+        if args.eval_metric is not None:
+            eval_metric = eval_metrics_map[args.eval_metric](args, self)
+            res['compute_metrics'], res['preprocess_logits_for_metrics'] = (eval_metric.compute_metrics,
+                                                                            eval_metric.preprocess_logits_for_metrics)
+        if args.loss_type is not None:
+            res['compute_loss_func'] = loss_map[args.loss_type](args, self)
+        return res
 
-        if self.optimizer is None:
-            if version.parse(
-                    transformers.__version__) < version.parse('4.34.0'):
-                logger.warning(
-                    f'If you are using lora+, please remember using transformers>=4.34.0, '
-                    f'but now is {transformers.__version__}')
-                return super().create_optimizer()
+    def create_optimizer_and_scheduler(self, num_training_steps: int):
+        optimizer_callback: OptimizerCallback = optimizers_map[self.args.optimizer or 'default'](self.args, self)
+        optimizer_callback.create_optimizer_and_scheduler(num_training_steps)
+
+    @staticmethod
+    def _get_listwise_reranker_preds(logits, labels):
+        positive_indices = torch.nonzero(labels == 1, as_tuple=False).squeeze(-1).tolist()
+        positive_indices.append(labels.shape[0])
+        preds = []
+        for i in range(len(positive_indices) - 1):
+            start, end = positive_indices[i], positive_indices[i + 1]
+            preds.append(logits[start:end].argmax())
+        preds = torch.tensor(preds)
+        labels = torch.tensor([0] * (len(positive_indices) - 1))
+        return preds, labels
+
+    def _compute_acc(self, outputs, labels, cu_seqlens=None) -> None:
+        args = self.args
+        logits = outputs.logits
+        metrics = None
+        task_type = self.task_type
+        problem_type = self.problem_type
+        if task_type == 'embedding':
+            return
+        elif task_type == 'seq_cls':
+            if problem_type == 'regression':
+                return
+            elif problem_type == 'multi_label_classification':
+                preds = logits.sigmoid() > 0.5
+                metrics = {'acc': (labels == preds).all(dim=-1)}
             else:
-                decay_parameters = self.get_decay_parameter_names(opt_model)
-            if isinstance(self.model, SwiftModel):
-                optimizer_grouped_parameters = self.model.create_optimizer_param_groups(
-                    lr=self.args.learning_rate,
-                    weight_decay=self.args.weight_decay)
+                preds = logits.argmax(dim=-1)
+                metrics = compute_acc(preds, labels)
+        elif task_type == 'causal_lm':
+            preds = logits.argmax(dim=-1)
+            if self.template.sequence_parallel_size > 1:
+                # Gather preds and labels across the sp group
+                if isinstance(preds, np.ndarray):
+                    preds = torch.from_numpy(preds).to(get_current_device())
+                if isinstance(labels, np.ndarray):
+                    labels = torch.from_numpy(labels).to(get_current_device())
+                assert labels.shape[1] == preds.shape[1]
+
+                if sequence_parallel.rp_world_size > 1:
+                    position_ids = sequence_parallel.real_position_ids
+                    position_ids = sequence_parallel.pad(position_ids, padding_value=-1, position_ids=position_ids)
+                else:
+                    position_ids = None
+                preds_output = sequence_parallel.gather(preds, dim=1, position_ids=position_ids)
+                labels_output = sequence_parallel.gather(labels, dim=1, position_ids=position_ids)
+                # roll back to fit compute_acc
+                labels_output = torch.roll(labels_output, shifts=1, dims=1)
+                preds = preds_output
+                labels = labels_output.int()
+
+            metrics = compute_acc(
+                preds,
+                labels,
+                acc_strategy=args.acc_strategy,
+                is_encoder_decoder=self.template.is_encoder_decoder,
+                cu_seqlens=cu_seqlens)
+        elif task_type in {'generative_reranker', 'reranker'}:
+            if logits.dim() == 2:
+                logits = logits.squeeze(-1)
+            if args.loss_type == 'listwise_reranker':
+                preds, labels = self._get_listwise_reranker_preds(logits, labels)
             else:
-                optimizer_grouped_parameters = [
-                    {
-                        'params': [
-                            p for n, p in opt_model.named_parameters()
-                            if (n in decay_parameters and p.requires_grad)
-                        ],
-                        'weight_decay':
-                        self.args.weight_decay,
-                    },
-                    {
-                        'params': [
-                            p for n, p in opt_model.named_parameters()
-                            if (n not in decay_parameters and p.requires_grad)
-                        ],
-                        'weight_decay':
-                        0.0,
-                    },
-                ]
+                preds = (logits > 0).long()
+            metrics = compute_acc(preds, labels.long())
+        if metrics:
+            mode = 'train' if self.model.training else 'eval'
+            for k, v in metrics.items():
+                self.custom_metrics[mode][k].update(v)
 
-            optimizer_cls, optimizer_kwargs = Trainer.get_optimizer_cls_and_kwargs(
-                self.args)
+    @torch.no_grad()
+    def _evalscope_eval(self):
+        from evalscope import TaskConfig, run_task
 
-            self.optimizer = optimizer_cls(optimizer_grouped_parameters,
-                                           **optimizer_kwargs)
-            if optimizer_cls.__name__ == 'Adam8bit':
-                import bitsandbytes
+        from ..pipelines.eval.utils import EvalModel
 
-                manager = bitsandbytes.optim.GlobalOptimManager.get_instance()
+        self.model.eval()
+        template = copy(self.template)
+        template.packing = False
+        template.padding_free = False
+        # prepare task config
+        task_config_kwargs = dict(
+            model=EvalModel(
+                model_name=f'model-step{self.state.global_step}',
+                model=self.model,
+                template=template,
+                max_batch_size=self.args.per_device_eval_batch_size,
+            ),
+            eval_type='swift_custom',
+            datasets=self.args.eval_dataset,
+            dataset_args=self.args.eval_dataset_args,
+            limit=self.args.eval_limit,
+            work_dir=os.path.join(self.args.output_dir, 'eval'),
+            eval_batch_size=self.args.per_device_eval_batch_size,
+            generation_config=self.args.eval_generation_config or {'max_tokens': 512},
+        )
+        task_config_kwargs.update(self.args.extra_eval_args or {})
+        task_config = TaskConfig(**task_config_kwargs)
+        # start evaluation
+        eval_report = run_task(task_config)
+        # convert to dict
+        eval_dict = {f'test_{k}': v.score for k, v in eval_report.items()}
+        self.log(eval_dict)
 
-                skipped = 0
-                for module in opt_model.modules():
-                    if isinstance(module, nn.Embedding):
-                        skipped += sum({
-                            p.data_ptr(): p.numel()
-                            for p in module.parameters()
-                        }.values())
-                        logger.info(
-                            f'skipped {module}: {skipped/2**20}M params')
-                        manager.register_module_override(
-                            module, 'weight', {'optim_bits': 32})
-                        logger.debug(
-                            f'bitsandbytes: will optimize {module} in fp32')
-                logger.info(f'skipped: {skipped/2**20}M params')
-        return self.optimizer
+        self.model.train()
+        return eval_dict
+
+    def prepare_logits_to_keep(self, inputs):
+        labels = inputs['labels']
+        loss_scale = inputs.get('loss_scale')
+        if self.template.sequence_parallel_size > 1:
+            raise NotImplementedError()
+        if labels.shape[0] == 1 and not is_mp():
+            # device_map may encounter device mismatch issues.
+            loss_mask = (labels != -100)[0]
+            labels = labels[:, loss_mask]
+            labels = nn.functional.pad(labels, (1, 0), value=-100)
+            if loss_scale is not None:
+                loss_scale = loss_scale[:, loss_mask]
+                inputs['loss_scale'] = nn.functional.pad(loss_scale, (1, 0), value=0)
+            logits_to_keep = nn.functional.pad(loss_mask[1:], (0, 1), value=True)
+        else:
+            logits_to_keep = labels.shape[-1] - ((labels != -100).int().argmax(-1).min().item()) + 1
+            assert logits_to_keep > 0
+            labels = labels[:, -logits_to_keep:]
+            if loss_scale is not None:
+                inputs['loss_scale'] = loss_scale[:, -logits_to_keep:]
+        inputs['labels'] = labels
+        inputs['logits_to_keep'] = logits_to_keep
+
+    def get_cu_seqlens(self, position_ids, logits_to_keep) -> torch.Tensor:
+        cu_seqlens = get_packed_seq_params(position_ids)['cu_seq_lens_q']
+        res_cu_seqlens = cu_seqlens.clone()
+        if isinstance(logits_to_keep, torch.Tensor):
+            for i in range(cu_seqlens.shape[0] - 1):
+                start, end = cu_seqlens[i], cu_seqlens[i + 1]
+                res_cu_seqlens[i + 1:] -= (~logits_to_keep[start:end]).sum()
+        elif isinstance(logits_to_keep, int):
+            res_cu_seqlens[1:] -= position_ids.shape[-1] + 1 - logits_to_keep
+        return res_cu_seqlens
+
+    @contextmanager
+    def _patch_skip_first_batches(self):
+        from transformers import trainer
+        origin_skip_first_batches = trainer.skip_first_batches
+
+        def skip_first_batches(dataloader, num_batches=0):
+            if isinstance(dataloader, (DataLoaderShard, DataLoaderDispatcher)):
+                # DataLoaderMixin
+                return self.get_train_dataloader(skip_batches=num_batches)
+            else:
+                return origin_skip_first_batches(dataloader, num_batches)
+
+        trainer.skip_first_batches = skip_first_batches
+        try:
+            yield
+        finally:
+            trainer.skip_first_batches = origin_skip_first_batches
+
+
+class DataLoaderMixin:
+
+    def get_sp_dataloader(self, dataset, batch_size, skip_batches=0):
+
+        data_collator = self.data_collator
+        if isinstance(dataset, datasets.Dataset):
+            dataset = self._remove_unused_columns(dataset, description='training')
+        else:
+            data_collator = self._get_collator_with_removed_columns(data_collator, description='training')
+        if hasattr(dataset, '__len__'):
+            sampler = SequenceParallelSampler(sequence_parallel, dataset, seed=42)
+            dataloader_params = {
+                'batch_size': batch_size,
+                'collate_fn': data_collator,
+                'num_workers': self.args.dataloader_num_workers,
+                'pin_memory': self.args.dataloader_pin_memory,
+                'persistent_workers': self.args.dataloader_persistent_workers,
+            }
+
+            if not isinstance(dataset, torch.utils.data.IterableDataset):
+                if skip_batches > 0:
+                    from accelerate.data_loader import SkipBatchSampler
+                    sampler = SkipBatchSampler(sampler, skip_batches=skip_batches * batch_size)
+                dataloader_params['sampler'] = sampler
+                dataloader_params['drop_last'] = self.args.dataloader_drop_last
+                dataloader_params['worker_init_fn'] = partial(
+                    seed_worker, num_workers=self.args.dataloader_num_workers, rank=sequence_parallel.dp_rank)
+
+            return DataLoaderShard(dataset, device=self.accelerator.device, **dataloader_params)
+        else:
+            dataloader_params = {
+                'collate_fn': data_collator,
+                'num_workers': self.args.dataloader_num_workers,
+                'pin_memory': self.args.dataloader_pin_memory,
+                'persistent_workers': self.args.dataloader_persistent_workers,
+                'prefetch_factor': self.args.dataloader_prefetch_factor
+            }
+            if dist.is_initialized() and dataloader_params['prefetch_factor']:
+                dataloader_params['prefetch_factor'] = dataloader_params['prefetch_factor'] * dist.get_world_size()
+            dataloader = DataLoader(dataset, batch_size=batch_size, **dataloader_params)
+            dataloader = SequenceParallelDispatcher(
+                dataloader, sequence_parallel, self.accelerator.device, skip_batches=skip_batches)
+            return dataloader
+
+    def get_train_dataloader(self, skip_batches=0):
+        dataloader = None
+        if self.template.sequence_parallel_size > 1:
+            dataloader = self.get_sp_dataloader(self.train_dataset, self._train_batch_size, skip_batches=skip_batches)
+        if dataloader is None:
+            # Higher efficiency
+            if self.train_dataset is None:
+                raise ValueError('Trainer: training requires a train_dataset.')
+            args = self.args
+            train_dataset = self.train_dataset
+
+            dataloader_params = {
+                'collate_fn': self.data_collator,
+                'num_workers': args.dataloader_num_workers,
+                'pin_memory': args.dataloader_pin_memory,
+                'persistent_workers': args.dataloader_persistent_workers,
+                'prefetch_factor': args.dataloader_prefetch_factor
+            }
+            batch_sampler_params = {
+                'drop_last':
+                args.dataloader_drop_last,
+                'shuffle':
+                args.train_dataloader_shuffle,
+                'data_seed':
+                args.data_seed,
+                'tp_size':
+                args.deepspeed['tensor_parallel']['autotp_size']
+                if args.deepspeed and 'tensor_parallel' in args.deepspeed else 1,
+            }
+
+            if hasattr(train_dataset, '__len__'):
+                if args.group_by_length:
+                    batch_sampler_params['group_by_length'] = args.group_by_length
+                    batch_sampler_params['lengths'] = train_dataset['lengths']
+                batch_sampler = BatchSamplerShard(
+                    len(train_dataset), batch_size=self._train_batch_size, **batch_sampler_params)
+                dataloader_params['worker_init_fn'] = partial(
+                    seed_worker, num_workers=self.args.dataloader_num_workers, rank=self.args.process_index)
+                if skip_batches > 0:
+                    from accelerate.data_loader import SkipBatchSampler
+                    batch_sampler = SkipBatchSampler(batch_sampler, skip_batches=skip_batches)
+                dataloader_params['batch_sampler'] = batch_sampler
+                dataloader = DataLoaderShard(train_dataset, device=self.accelerator.device, **dataloader_params)
+            else:
+                # IterableDataset
+                if dist.is_initialized() and dataloader_params['prefetch_factor']:
+                    dataloader_params['prefetch_factor'] = dataloader_params['prefetch_factor'] * dist.get_world_size()
+                dataloader = DataLoader(train_dataset, batch_size=self._train_batch_size, **dataloader_params)
+                dataloader = DataLoaderDispatcher(dataloader, self.accelerator.device, skip_batches=skip_batches)
+        return dataloader
+
+    @contextmanager
+    def _disable_group_by_length(self):
+        group_by_length = getattr(self.args, 'group_by_length', False)
+        self.args.group_by_length = False
+        try:
+            yield
+        finally:
+            self.args.group_by_length = group_by_length
+
+    def get_eval_dataloader(self, eval_dataset=None):
+        dataloader = None
+        if self.template.sequence_parallel_size > 1:
+            if eval_dataset is None and self.eval_dataset is None:
+                raise ValueError('Trainer: evaluation requires an eval_dataset.')
+            eval_dataset = eval_dataset if eval_dataset is not None else self.eval_dataset
+            dataloader = self.get_sp_dataloader(eval_dataset, self.args.eval_batch_size)
+        if dataloader is None:
+            with self._disable_group_by_length():
+                return super().get_eval_dataloader(eval_dataset=eval_dataset)
+        return dataloader

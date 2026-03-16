@@ -1,8 +1,8 @@
+# Copyright (c) ModelScope Contributors. All rights reserved.
+import gradio as gr
 from typing import Type
 
-import gradio as gr
-
-from swift.ui.base import BaseUI
+from ..base import BaseUI
 
 
 class Save(BaseUI):
@@ -10,31 +10,11 @@ class Save(BaseUI):
     group = 'llm_train'
 
     locale_dict = {
-        'save_param': {
+        'save_tab': {
             'label': {
-                'zh': '存储参数',
+                'zh': '存储参数设置',
                 'en': 'Saving settings'
             },
-        },
-        'save_steps': {
-            'label': {
-                'zh': '存储步数',
-                'en': 'save steps',
-            },
-            'info': {
-                'zh': '设置每个多少步数进行存储',
-                'en': 'Set the save steps',
-            }
-        },
-        'output_dir': {
-            'label': {
-                'zh': '存储目录',
-                'en': 'The output dir',
-            },
-            'info': {
-                'zh': '设置输出模型存储在哪个文件夹下',
-                'en': 'Set the output folder',
-            }
         },
         'push_to_hub': {
             'label': {
@@ -66,7 +46,7 @@ class Save(BaseUI):
                 'en': 'Set the model as private',
             }
         },
-        'push_hub_strategy': {
+        'hub_strategy': {
             'label': {
                 'zh': '推送策略',
                 'en': 'Push strategy',
@@ -90,15 +70,14 @@ class Save(BaseUI):
 
     @classmethod
     def do_build_ui(cls, base_tab: Type['BaseUI']):
-        with gr.Accordion(elem_id='save_param', open=True):
+        with gr.TabItem(elem_id='save_tab'):
             with gr.Blocks():
-                with gr.Row():
-                    gr.Textbox(
-                        elem_id='save_steps', value='500', lines=1, scale=5)
-                    gr.Textbox(elem_id='output_dir', scale=20)
                 with gr.Row():
                     gr.Checkbox(elem_id='push_to_hub', scale=20)
                     gr.Textbox(elem_id='hub_model_id', lines=1, scale=20)
                     gr.Checkbox(elem_id='hub_private_repo', scale=20)
-                    gr.Dropdown(elem_id='push_hub_strategy', scale=20)
+                    gr.Dropdown(
+                        elem_id='hub_strategy',
+                        scale=20,
+                        choices=['end', 'every_save', 'checkpoint', 'all_checkpoints'])
                     gr.Textbox(elem_id='hub_token', lines=1, scale=20)

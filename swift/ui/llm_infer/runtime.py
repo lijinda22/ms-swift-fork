@@ -1,16 +1,18 @@
+# Copyright (c) ModelScope Contributors. All rights reserved.
+import collections
+import gradio as gr
 import os.path
+import psutil
+import re
 import subprocess
+import sys
 import time
 from datetime import datetime
+from packaging import version
 from typing import Dict, List, Tuple, Type
 
-import gradio as gr
-import psutil
-import torch
-
-from swift.llm import DeployArguments
-from swift.ui.base import BaseUI
-from swift.utils import get_logger
+from swift.utils import format_time, get_logger
+from ..base import BaseUI
 
 logger = get_logger()
 
@@ -20,6 +22,10 @@ class Runtime(BaseUI):
 
     group = 'llm_infer'
 
+    cmd = 'deploy'
+
+    log_event = {}
+
     locale_dict = {
         'runtime_tab': {
             'label': {
@@ -27,191 +33,261 @@ class Runtime(BaseUI):
                 'en': 'Runtime'
             },
         },
-        'running_tasks': {
+        'running_cmd': {
             'label': {
-                'zh': '运行中任务',
-                'en': 'Running Tasks'
+                'zh': '运行命令',
+                'en': 'Command line'
             },
             'info': {
-                'zh': '运行中的任务（所有的swift deploy命令）',
-                'en': 'All running tasks(started by swift deploy)'
+                'zh': '执行的实际命令',
+                'en': 'The actual command'
             }
         },
-        'show_curl': {
+        'show_log': {
+            'value': {
+                'zh': '展示部署状态',
+                'en': 'Show running status'
+            },
+        },
+        'stop_show_log': {
+            'value': {
+                'zh': '停止展示',
+                'en': 'Stop showing running status'
+            },
+        },
+        'log': {
             'label': {
-                'zh': 'curl调用方式展示',
-                'en': 'Show curl calling method'
+                'zh': '日志输出',
+                'en': 'Logging content'
             },
             'info': {
-                'zh': '仅展示，不可编辑',
-                'en': 'Not editable'
+                'zh': '如果日志无更新请再次点击"展示部署状态"',
+                'en': 'Please press "Show running status" if the log content is not updating'
+            }
+        },
+        'running_tasks': {
+            'label': {
+                'zh': '运行中部署',
+                'en': 'Running deployments'
+            },
+            'info': {
+                'zh': '所有的swift deploy命令启动的任务',
+                'en': 'Started by swift deploy'
             }
         },
         'refresh_tasks': {
             'value': {
-                'zh': '刷新运行时任务',
-                'en': 'Refresh tasks'
+                'zh': '找回部署',
+                'en': 'Find deployments'
             },
         },
         'kill_task': {
             'value': {
-                'zh': '停止任务',
+                'zh': '杀死部署',
                 'en': 'Kill running task'
             },
-        }
+        },
     }
 
     @classmethod
     def do_build_ui(cls, base_tab: Type['BaseUI']):
         with gr.Accordion(elem_id='runtime_tab', open=False, visible=True):
             with gr.Blocks():
-                with gr.Column():
-                    with gr.Row():
-                        gr.Dropdown(elem_id='running_tasks', scale=10)
-                        gr.Button(elem_id='refresh_tasks', scale=1)
-                        gr.Button(elem_id='kill_task', scale=1)
-                    gr.Textbox(elem_id='show_curl', interactive=False)
+                with gr.Row(equal_height=True):
+                    gr.Dropdown(elem_id='running_tasks', scale=10, allow_custom_value=True)
+                    gr.Button(elem_id='refresh_tasks', scale=1, variant='primary')
+                    gr.Button(elem_id='show_log', scale=1, variant='primary')
+                    gr.Button(elem_id='stop_show_log', scale=1)
+                    gr.Button(elem_id='kill_task', scale=1)
+                with gr.Row():
+                    gr.Textbox(elem_id='log', lines=6, visible=False)
+
+                concurrency_limit = {}
+                if version.parse(gr.__version__) >= version.parse('4.0.0'):
+                    concurrency_limit = {'concurrency_limit': 5}
+                base_tab.element('show_log').click(cls.update_log, [],
+                                                   [cls.element('log')]).then(cls.wait,
+                                                                              [base_tab.element('running_tasks')],
+                                                                              [cls.element('log')], **concurrency_limit)
+
+                base_tab.element('stop_show_log').click(cls.break_log_event, [cls.element('running_tasks')], [])
+
                 base_tab.element('refresh_tasks').click(
-                    Runtime.refresh_tasks,
+                    cls.refresh_tasks,
                     [base_tab.element('running_tasks')],
-                    [base_tab.element('show_curl')]
-                    + [base_tab.element('running_tasks')],
-                )
-                base_tab.element('kill_task').click(
-                    Runtime.kill_task,
                     [base_tab.element('running_tasks')],
-                    [base_tab.element('running_tasks')]
-                    + [base_tab.element('show_curl')],
                 )
 
-    @staticmethod
-    def refresh_tasks(running_task=None):
-        output_dir = running_task if not running_task or 'pid:' not in running_task else None
+    @classmethod
+    def break_log_event(cls, task):
+        if not task:
+            return
+        pid, all_args = cls.parse_info_from_cmdline(task)
+        cls.log_event[all_args['log_file']] = True
+
+    @classmethod
+    def update_log(cls):
+        return gr.update(visible=True)
+
+    @classmethod
+    def wait(cls, task):
+        if not task:
+            return [None]
+        _, args = cls.parse_info_from_cmdline(task)
+        log_file = args['log_file']
+        cls.log_event[log_file] = False
+        offset = 0
+        latest_data = ''
+        lines = collections.deque(maxlen=int(os.environ.get('MAX_LOG_LINES', 100)))
+        try:
+            with open(log_file, 'r', encoding='utf-8') as input:
+                input.seek(offset)
+                fail_cnt = 0
+                while True:
+                    try:
+                        latest_data += input.read()
+                    except UnicodeDecodeError:
+                        continue
+                    if not latest_data:
+                        time.sleep(0.5)
+                        fail_cnt += 1
+                        if fail_cnt > 50:
+                            break
+
+                    if cls.log_event.get(log_file, False):
+                        cls.log_event[log_file] = False
+                        break
+
+                    if '\n' not in latest_data:
+                        continue
+                    latest_lines = latest_data.split('\n')
+                    if latest_data[-1] != '\n':
+                        latest_data = latest_lines[-1]
+                        latest_lines = latest_lines[:-1]
+                    else:
+                        latest_data = ''
+                    lines.extend(latest_lines)
+                    yield '\n'.join(lines)
+        except IOError:
+            pass
+
+    @classmethod
+    def get_all_ports(cls):
         process_name = 'swift'
-        cmd_name = 'deploy'
+        cmd_name = cls.cmd
+        ports = set()
+        for proc in psutil.process_iter():
+            try:
+                cmdlines = proc.cmdline()
+            except (psutil.ZombieProcess, psutil.AccessDenied, psutil.NoSuchProcess):
+                cmdlines = []
+            if any([process_name in cmdline for cmdline in cmdlines]) and any(  # noqa
+                [cmd_name == cmdline for cmdline in cmdlines]):  # noqa
+                try:
+                    ports.add(int(cls.parse_info_from_cmdline(cls.construct_running_task(proc))[1].get('port', 8000)))
+                except IndexError:
+                    pass
+        return ports
+
+    @classmethod
+    def refresh_tasks(cls, running_task=None):
+        log_file = running_task if not running_task or 'pid:' not in running_task else None
+        process_name = 'swift'
+        negative_name = 'swift.exe'
+        cmd_name = cls.cmd
         process = []
         selected = None
         for proc in psutil.process_iter():
             try:
                 cmdlines = proc.cmdline()
-            except (psutil.ZombieProcess, psutil.AccessDenied,
-                    psutil.NoSuchProcess):
+            except (psutil.ZombieProcess, psutil.AccessDenied, psutil.NoSuchProcess):
                 cmdlines = []
             if any([process_name in cmdline
-                    for cmdline in cmdlines]) and any(  # noqa
-                        [cmd_name == cmdline for cmdline in cmdlines]):  # noqa
-                process.append(Runtime.construct_running_task(proc))
-                if output_dir is not None and any(  # noqa
-                    [output_dir == cmdline for cmdline in cmdlines]):  # noqa
-                    selected = Runtime.construct_running_task(proc)
+                    for cmdline in cmdlines]) and not any([negative_name in cmdline
+                                                           for cmdline in cmdlines]) and any(  # noqa
+                                                               [cmd_name == cmdline for cmdline in cmdlines]):  # noqa
+                process.append(cls.construct_running_task(proc))
+                if log_file is not None and any(  # noqa
+                    [log_file == cmdline for cmdline in cmdlines]):  # noqa
+                    selected = cls.construct_running_task(proc)
         if not selected:
             if running_task and running_task in process:
                 selected = running_task
         if not selected and process:
             selected = process[0]
-        return Runtime.show_curl(selected), gr.update(
-            choices=process, value=selected)
+        return gr.update(choices=process, value=selected)
 
     @staticmethod
     def construct_running_task(proc):
         pid = proc.pid
         ts = time.time()
         create_time = proc.create_time()
-        create_time_formatted = datetime.fromtimestamp(create_time).strftime(
-            '%Y-%m-%d, %H:%M')
-
-        def format_time(seconds):
-            days = int(seconds // (24 * 3600))
-            hours = int((seconds % (24 * 3600)) // 3600)
-            minutes = int((seconds % 3600) // 60)
-            seconds = int(seconds % 60)
-
-            if days > 0:
-                time_str = f'{days}d {hours}h {minutes}m {seconds}s'
-            elif hours > 0:
-                time_str = f'{hours}h {minutes}m {seconds}s'
-            elif minutes > 0:
-                time_str = f'{minutes}m {seconds}s'
-            else:
-                time_str = f'{seconds}s'
-
-            return time_str
+        create_time_formatted = datetime.fromtimestamp(create_time).strftime('%Y-%m-%d, %H:%M')
 
         return f'pid:{pid}/create:{create_time_formatted}' \
                f'/running:{format_time(ts - create_time)}/cmd:{" ".join(proc.cmdline())}'
 
-    @staticmethod
-    def kill_task(task):
-        if task is None:
-            return None, None
-        pid = task.split('/')[0].split(':')[1]
-        result = subprocess.run(['ps', '--ppid', f'{pid}'],
-                                stdout=subprocess.PIPE,
-                                stderr=subprocess.PIPE,
-                                text=True)
-        std_out = result.stdout
-        ppid = std_out.split('\n')[1].split(' ')[0]
-        os.system(f'kill -9 {pid}')
-        os.system(f'kill -9 {ppid}')
-        time.sleep(1)
-        torch.cuda.empty_cache()
-        return None, None
+    @classmethod
+    def parse_info_from_cmdline(cls, task):
+        pid = None
+        for i in range(3):
+            slash = task.find('/')
+            if i == 0:
+                pid = task[:slash].split(':')[1]
+            task = task[slash + 1:]
+        args = task.split(f'swift {cls.cmd}')[1]
+        args = [arg.strip() for arg in args.split('--') if arg.strip()]
+        all_args = {}
+        for i in range(len(args)):
+            space = args[i].find(' ')
+            splits = args[i][:space], args[i][space + 1:]
+            all_args[splits[0]] = splits[1]
+        return pid, all_args
 
-    @staticmethod
-    def show_curl(selected_task):
-
-        if selected_task is None:
-            return None
-
-        prompt = '浙江 -> 杭州 安徽 -> 合肥 四川 ->'
-        content = '晚上睡不着觉怎么办？'
-        deploy_cmd_args = selected_task.split('swift deploy')[1].strip().split(
-            ' ')
-        deploy_cmd_args_dict = {
-            k: v
-            for k, v in zip(deploy_cmd_args[0::2], deploy_cmd_args[1::2])
-        }
-
-        if '--model_id_or_path' not in deploy_cmd_args_dict.keys():
-            # ckpt_dir
-            if '--ckpt_dir' in deploy_cmd_args_dict.keys():
-                deploy_args = DeployArguments(
-                    ckpt_dir=deploy_cmd_args_dict['--ckpt_dir'])
-                model = deploy_args.model_type
-                template_type = deploy_args.template_type
+    @classmethod
+    def kill_task(cls, task):
+        if task:
+            pid, all_args = cls.parse_info_from_cmdline(task)
+            log_file = all_args['log_file']
+            if sys.platform == 'win32':
+                command = ['taskkill', '/f', '/t', '/pid', pid]
             else:
-                return None
+                command = ['pkill', '-9', '-f', log_file]
+            try:
+                result = subprocess.run(command, capture_output=True, text=True)
+                assert result.returncode == 0
+            except Exception as e:
+                raise e
+            cls.break_log_event(task)
+        return [cls.refresh_tasks()] + [gr.update(value=None)]
+
+    @classmethod
+    def task_changed(cls, task, base_tab):
+        if task:
+            _, all_args = cls.parse_info_from_cmdline(task)
         else:
-            if '--model_type' not in deploy_cmd_args_dict.keys():
-                model = DeployArguments(
-                    model_id_or_path=deploy_cmd_args_dict['--model_id_or_path']
-                ).model_type
-                template_type = deploy_cmd_args_dict['--template_type']
+            all_args = {}
+        elements = list(base_tab.valid_elements().values())
+        ret = []
+        is_adapter = ('adapters' in all_args) and ('model' not in all_args)
+        for e in elements:
+            if e.elem_id in all_args:
+                if isinstance(e, gr.Dropdown) and e.multiselect:
+                    arg = all_args[e.elem_id].split(' ')
+                elif isinstance(e, gr.Slider) and re.fullmatch(cls.int_regex, all_args[e.elem_id]):
+                    arg = int(all_args[e.elem_id])
+                elif isinstance(e, gr.Slider) and re.fullmatch(cls.float_regex, all_args[e.elem_id]):
+                    arg = float(all_args[e.elem_id])
+                else:
+                    if e.elem_id == 'model':
+                        if is_adapter:
+                            arg = all_args['adapters']
+                        else:
+                            arg = all_args[e.elem_id]
+                    else:
+                        arg = all_args[e.elem_id]
+                ret.append(gr.update(value=arg))
             else:
-                # moved model path
-                model = deploy_cmd_args_dict['--model_type']
-                template_type = deploy_cmd_args_dict['--template_type']
-
-        host = deploy_cmd_args_dict.get('--host', '127.0.0.1')
-        port = deploy_cmd_args_dict.get('--port', 8000)
-        max_tokens = 32
-
-        if template_type.endswith('generation'):
-            curl_cmd = f'curl http://{host}:{port}/v1/completions ' \
-                       '-H ' \
-                       '"Content-Type: application/json" \\ \n' \
-                       '-d ' \
-                       "'{" \
-                       f'"model": "{model}","prompt": "{prompt}","max_tokens": {max_tokens},' \
-                       '"temperature": 0.1,"seed": 42' \
-                       "}'"
-        else:
-            curl_cmd = f'curl http://{host}:{port}/v1/chat/completions ' \
-                       '-H ' \
-                       '"Content-Type: application/json" \\ \n' \
-                       '-d ' \
-                       "'{" \
-                       f'"model": "{model}","messages": [{{"role": "user", "content": "{content}"}}],' \
-                       f'"max_tokens": {max_tokens},"temperature": 0' \
-                       "}'"
-        return curl_cmd
+                ret.append(gr.update())
+        cls.break_log_event(task)
+        return ret + [gr.update(value=None)]
